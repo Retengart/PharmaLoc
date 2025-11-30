@@ -1,0 +1,16 @@
+osmnx
+geopandas
+pandas
+numpy
+folium
+h3
+matplotlib
+seaborn
+shapely
+geopy
+plotly
+scikit-learn
+imbalanced-learn
+joblib
+catboost
+optuna

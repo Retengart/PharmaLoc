@@ -59,7 +59,7 @@ Original file is located at
 """
 
 # Этап 1: Подготовка данных и определение задачи
-!pip install osmnx geopandas folium h3 scikit-learn matplotlib seaborn plotly
+# !pip install osmnx geopandas folium h3 scikit-learn matplotlib seaborn plotly geopy
 
 import warnings
 warnings.filterwarnings('ignore')
