@@ -1,6 +1,5 @@
 import osmnx as ox
 import geopandas as gpd
-import pandas as pd
 import json
 import os
 from . import config
@@ -56,10 +55,6 @@ def save_osm_data(osm_data, roi_params):
         if not data.empty:
             filename = os.path.join(config.DATA_DIR, f"{name}_data.geojson")
             try:
-                # Convert columns with list values to string to allow saving to GeoJSON
-                # Some OSM tags return lists, which GeoJSON driver might struggle with if not handled, 
-                # but geopandas usually handles it or we clean it. 
-                # For simplicity, we just save.
                 data.to_file(filename, driver="GeoJSON")
                 print(f"✓ {name}: данные сохранены в {filename}")
             except Exception as e:
@@ -80,10 +75,9 @@ def load_osm_data():
             print(f"✗ {name}: файл не найден, создаем пустой")
             osm_data[name] = gpd.GeoDataFrame()
             
-    # Load roads separately
     try:
         osm_data['roads'] = gpd.read_file(os.path.join(config.DATA_DIR, "roads_data.geojson"))
-    except:
+    except Exception:
         osm_data['roads'] = gpd.GeoDataFrame()
         
     return osm_data

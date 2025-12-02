@@ -1,17 +1,27 @@
-osmnx
-geopandas
-pandas
-numpy
-folium
-h3
-matplotlib
-seaborn
-shapely
-geopy
-plotly
-scikit-learn
-scipy
-imbalanced-learn
-joblib
-catboost
-optuna
+# Геопространственный анализ
+osmnx>=1.6.0
+geopandas>=0.14.0
+h3>=3.7.0
+shapely>=2.0.0
+geopy>=2.4.0
+folium>=0.15.0
+
+# Обработка данных
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Визуализация
+matplotlib>=3.7.0
+seaborn>=0.13.0
+plotly>=5.18.0
+
+# Машинное обучение
+scikit-learn>=1.3.0
+imbalanced-learn>=0.11.0
+catboost>=1.2.0
+optuna>=3.4.0
+
+# Параллельная обработка
+pandarallel>=1.6.0
+joblib>=1.3.0

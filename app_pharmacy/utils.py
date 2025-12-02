@@ -1,6 +1,4 @@
 import importlib
-import subprocess
-import sys
 
 REQUIRED_PACKAGES = [
     "osmnx",
@@ -22,13 +20,10 @@ REQUIRED_PACKAGES = [
 ]
 
 def check_and_install_dependencies():
-    """
-    Проверяет наличие необходимых библиотек и предлагает их установку.
-    """
+    """Проверяет наличие необходимых библиотек и предлагает их установку."""
     missing = []
     for package in REQUIRED_PACKAGES:
         try:
-            # Mapping for packages where import name != package name
             import_name = package
             if package == "scikit-learn":
                 import_name = "sklearn"
@@ -43,7 +38,6 @@ def check_and_install_dependencies():
         print(f"⚠️ Отсутствуют следующие библиотеки: {', '.join(missing)}")
         print("Рекомендуется установить их с помощью команды:")
         print(f"uv pip install {' '.join(missing)}")
-        # В реальном сценарии можно предложить автоустановку, но безопаснее просто сообщить
         return False
     
     print("✅ Все необходимые библиотеки установлены.")

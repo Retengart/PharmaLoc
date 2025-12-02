@@ -1,8 +1,7 @@
 import h3
 import geopandas as gpd
-import pandas as pd
 import numpy as np
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Polygon
 from geopy.distance import geodesic
 from . import config
 
@@ -51,7 +50,6 @@ def calculate_distance_based_features(h3_grid, poi_data, feature_name, radii=con
         h3_grid[f'{feature_name}_nearest_distance'] = float('inf')
         return h3_grid
 
-    # Prepare POI points
     if 'Point' not in poi_data.geometry.geom_type.values:
         poi_points = poi_data.copy()
         poi_points.geometry = poi_points.geometry.centroid
@@ -96,14 +94,8 @@ def calculate_area_based_features(h3_grid, area_data, feature_name):
             if area.geometry and not area.geometry.is_empty:
                 if cell.geometry.intersects(area.geometry):
                     intersection = cell.geometry.intersection(area.geometry)
-                    # Approximate conversion from deg^2 to km^2 (very rough, dependent on latitude)
-                    # Better to project to UTM, but keeping it simple as in original script
                     area_deg2 = intersection.area
-                    area_km2 = area_deg2 * 111 * 111 * np.cos(np.radians(cell.center_lat)) 
-                    # Original script used simplified 111*111 without cos correction, sticking to improved version or original?
-                    # Let's stick to original logic structure but maybe slight improve or keep consistent.
-                    # Original: area_deg2 * 111 * 111 
-                    total_intersection += area_deg2 * 12321 # 111*111
+                    total_intersection += area_deg2 * 12321
         
         coverage = min(total_intersection / cell_area_km2, 1.0) if cell_area_km2 > 0 else 0
         h3_grid.loc[idx, f'{feature_name}_coverage'] = coverage
@@ -131,9 +123,9 @@ def calculate_road_features(h3_grid, roads_data):
 
 def calculate_custom_features(h3_grid):
     """Дополнительные признаки"""
-    # Multifunctionality
-    features = ['transport_count_500m', 'residential_count_500m', 
-                'medical_count_500m', 'office_count_500m', 'retail_count_500m']
+    features = ['transport_subway_count_500m', 'transport_ground_count_500m', 
+                'residential_count_500m', 'medical_count_500m', 
+                'office_count_500m', 'retail_count_500m']
     
     bool_cols = []
     for f in features:
@@ -146,10 +138,27 @@ def calculate_custom_features(h3_grid):
         h3_grid['multifunctionality_index'] = h3_grid[bool_cols].sum(axis=1)
         h3_grid.drop(columns=bool_cols, inplace=True)
         
-    # Medical Synergy
     if 'medical_nearest_distance' in h3_grid.columns:
         h3_grid['medical_synergy'] = np.maximum(0, 1 - h3_grid['medical_nearest_distance'] / 300)
         h3_grid['medical_synergy'] = np.minimum(h3_grid['medical_synergy'], 1.0)
+    
+    return h3_grid
+
+def calculate_competitor_features(h3_grid, pharmacies_data):
+    """Анализ типов конкурентов (сетевые vs одиночные)"""
+    if pharmacies_data.empty:
+        h3_grid['competitor_chain_count_500m'] = 0
+        return h3_grid
+        
+    known_chains = ['ригла', '36.6', 'горздрав', 'планета здоровья', 'апрель', 'вита', 'неофарм', 'столички', 'самсон-фарма', 'доктор столетов']
+    
+    pharmacies_data['is_chain'] = pharmacies_data['name'].fillna('').str.lower().apply(
+        lambda x: any(chain in x for chain in known_chains)
+    )
+    
+    chain_pharmacies = pharmacies_data[pharmacies_data['is_chain']]
+    
+    h3_grid = calculate_distance_based_features(h3_grid, chain_pharmacies, 'competitor_chain', radii=[500])
     
     return h3_grid
 
