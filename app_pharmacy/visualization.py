@@ -631,3 +631,155 @@ def plot_cluster_profiles(df, cluster_col='cluster', features=None, filename='cl
     plt.close()
     
     return cluster_means
+
+
+def plot_business_metrics(results, model_name='Best Model', filename='business_metrics.png'):
+    """
+    Визуализация бизнес-метрик: Precision@K, Lift, Bootstrap CI.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # 1. Precision@K
+    if 'precision_at_k' in results:
+        p_at_k = results['precision_at_k']
+        ks = [int(k.split('@')[1]) for k in p_at_k.keys()]
+        vals = list(p_at_k.values())
+        
+        axes[0].bar(ks, vals, color='#2ecc71', alpha=0.8, edgecolor='black')
+        axes[0].set_xlabel('K')
+        axes[0].set_ylabel('Precision@K')
+        axes[0].set_title('Precision@K\n(доля успешных в топ-K)', fontsize=11, fontweight='bold')
+        axes[0].set_ylim(0, 1)
+        for i, v in enumerate(vals):
+            axes[0].text(ks[i], v + 0.02, f'{v:.2f}', ha='center', fontsize=10)
+    
+    # 2. Lift@K
+    if 'lift' in results:
+        lift = results['lift']
+        ks = [int(k.split('@')[1]) for k in lift.keys()]
+        vals = list(lift.values())
+        
+        axes[1].bar(ks, vals, color='#3498db', alpha=0.8, edgecolor='black')
+        axes[1].axhline(y=1, color='red', linestyle='--', label='Baseline (random)')
+        axes[1].set_xlabel('K')
+        axes[1].set_ylabel('Lift')
+        axes[1].set_title('Lift@K\n(во сколько раз лучше случайного)', fontsize=11, fontweight='bold')
+        axes[1].legend()
+        for i, v in enumerate(vals):
+            axes[1].text(ks[i], v + 0.1, f'{v:.1f}x', ha='center', fontsize=10)
+    
+    # 3. Bootstrap CI
+    if 'bootstrap_ci' in results:
+        boot = results['bootstrap_ci']
+        metrics = ['f1', 'precision', 'recall', 'roc_auc']
+        means = [boot[m]['mean'] for m in metrics if m in boot]
+        lowers = [boot[m]['ci_lower'] for m in metrics if m in boot]
+        uppers = [boot[m]['ci_upper'] for m in metrics if m in boot]
+        metric_names = [m for m in metrics if m in boot]
+        
+        x = np.arange(len(metric_names))
+        errors = [[m - l for m, l in zip(means, lowers)],
+                  [u - m for m, u in zip(means, uppers)]]
+        
+        axes[2].bar(x, means, yerr=errors, color='#9b59b6', alpha=0.8, 
+                   edgecolor='black', capsize=5)
+        axes[2].set_xticks(x)
+        axes[2].set_xticklabels(metric_names)
+        axes[2].set_ylabel('Значение метрики')
+        axes[2].set_title('Bootstrap 95% CI\n(доверительные интервалы)', fontsize=11, fontweight='bold')
+        axes[2].set_ylim(0, 1)
+    
+    plt.suptitle(f'Бизнес-метрики модели: {model_name}', fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    output_path = os.path.join(config.DATA_DIR, filename)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"📊 Бизнес-метрики сохранены в {output_path}")
+    plt.close()
+
+
+def plot_vif_analysis(vif_df, threshold=None, filename='vif_analysis.png'):
+    """
+    Визуализация VIF (Variance Inflation Factor) для анализа мультиколлинеарности.
+    """
+    if threshold is None:
+        threshold = config.FEATURE_CONFIG['vif_threshold']
+    
+    # Берём топ-20 признаков с высоким VIF
+    vif_top = vif_df.head(20).copy()
+    vif_top = vif_top[vif_top['VIF'] < 1000]  # Исключаем inf
+    
+    if vif_top.empty:
+        print("⚠️ Нет данных для VIF визуализации")
+        return
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    colors = ['#e74c3c' if v > threshold else '#2ecc71' for v in vif_top['VIF']]
+    
+    bars = ax.barh(range(len(vif_top)), vif_top['VIF'], color=colors, alpha=0.8, edgecolor='black')
+    
+    ax.axvline(x=threshold, color='red', linestyle='--', linewidth=2, 
+               label=f'Порог VIF = {threshold}')
+    
+    ax.set_yticks(range(len(vif_top)))
+    ax.set_yticklabels(vif_top['feature'], fontsize=9)
+    ax.set_xlabel('VIF (Variance Inflation Factor)', fontsize=11)
+    ax.set_title('Анализ мультиколлинеарности признаков\n(VIF > 10 указывает на сильную корреляцию)', 
+                fontsize=12, fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.invert_yaxis()
+    
+    # Аннотации
+    for i, v in enumerate(vif_top['VIF']):
+        ax.text(v + 0.5, i, f'{v:.1f}', va='center', fontsize=8)
+    
+    plt.tight_layout()
+    
+    output_path = os.path.join(config.DATA_DIR, filename)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"📊 VIF анализ сохранен в {output_path}")
+    plt.close()
+
+
+def plot_spatial_cv_results(cv_results, filename='spatial_cv_results.png'):
+    """
+    Визуализация результатов пространственной кросс-валидации.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # 1. Сравнение Standard CV vs Spatial CV
+    models = list(cv_results.keys())
+    standard_cv = [cv_results[m].get('cv_f1_mean', 0) for m in models]
+    spatial_cv = [cv_results[m].get('spatial_cv_f1', 0) for m in models]
+    
+    x = np.arange(len(models))
+    width = 0.35
+    
+    axes[0].bar(x - width/2, standard_cv, width, label='Standard CV', color='#3498db', alpha=0.8)
+    axes[0].bar(x + width/2, spatial_cv, width, label='Spatial CV', color='#e74c3c', alpha=0.8)
+    
+    axes[0].set_ylabel('F1 Score')
+    axes[0].set_title('Сравнение Standard CV и Spatial CV', fontsize=11, fontweight='bold')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(models)
+    axes[0].legend()
+    axes[0].set_ylim(0, 1)
+    
+    # 2. Разница (overfitting indicator)
+    diff = [s - sp for s, sp in zip(standard_cv, spatial_cv)]
+    colors = ['#e74c3c' if d > 0.1 else '#2ecc71' for d in diff]
+    
+    axes[1].bar(models, diff, color=colors, alpha=0.8, edgecolor='black')
+    axes[1].axhline(y=0.1, color='red', linestyle='--', label='Порог переобучения')
+    axes[1].set_ylabel('Разница (Standard - Spatial)')
+    axes[1].set_title('Индикатор переобучения\n(большая разница = возможный overfitting)', 
+                     fontsize=11, fontweight='bold')
+    axes[1].legend()
+    
+    plt.tight_layout()
+    
+    output_path = os.path.join(config.DATA_DIR, filename)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"📊 Результаты Spatial CV сохранены в {output_path}")
+    plt.close()

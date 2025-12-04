@@ -1,14 +1,21 @@
+"""
+Модуль машинного обучения для геомаркетингового анализа.
+Включает: подготовку данных, обучение моделей, калибровку, оценку качества.
+"""
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, GroupKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, 
                              roc_auc_score, silhouette_score, calinski_harabasz_score,
-                             davies_bouldin_score)
+                             davies_bouldin_score, average_precision_score)
 from sklearn.cluster import KMeans
 from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import TomekLinks
+from imblearn.combine import SMOTETomek
 from imblearn.pipeline import Pipeline as ImbPipeline
 import joblib
 from collections import Counter
@@ -25,6 +32,7 @@ from . import config
 LEAKAGE_FEATURES = config.LEAKAGE_FEATURES
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 
 def filter_leakage_features(feature_columns, exclude_leakage=True):
     """Фильтрует признаки с утечкой данных."""
@@ -49,14 +57,17 @@ def prepare_data(h3_grid, feature_columns, exclude_leakage=False):
     
     df = h3_grid.copy()
     
+    default_distance = config.FEATURE_CONFIG['default_distance_fillna']
+    default_count = config.FEATURE_CONFIG['default_count_fillna']
+    
     # Обработка пропусков
     for col in feature_columns:
         if col not in df.columns:
             continue
         if 'distance' in col:
-            df[col] = df[col].fillna(10000)
+            df[col] = df[col].fillna(default_distance)
         elif 'density' in col or 'count' in col:
-            df[col] = df[col].fillna(0)
+            df[col] = df[col].fillna(default_count)
         else:
             df[col] = df[col].fillna(df[col].median())
             
@@ -75,123 +86,203 @@ def prepare_data(h3_grid, feature_columns, exclude_leakage=False):
     return X, y
 
 
-def spatial_cross_validation(X, y, h3_grid, n_splits=5):
-    """Пространственная кросс-валидация на основе кластеров H3 ячеек."""
-    from sklearn.cluster import KMeans
-    
+def get_district_groups(h3_grid):
+    """
+    Определяет группы ячеек по районам для Spatial CV.
+    Использует кластеризацию координат как прокси для районов.
+    """
     coords = h3_grid[['center_lat', 'center_lon']].values
-    kmeans = KMeans(n_clusters=n_splits, random_state=42, n_init=10)
-    spatial_clusters = kmeans.fit_predict(coords)
+    n_groups = config.ML_CONFIG['spatial_cv_n_splits']
     
-    splits = []
-    for fold in range(n_splits):
-        test_idx = np.where(spatial_clusters == fold)[0]
-        train_idx = np.where(spatial_clusters != fold)[0]
-        
-        if y.iloc[test_idx].sum() > 0:
-            splits.append((train_idx, test_idx))
+    kmeans = KMeans(n_clusters=n_groups, random_state=42, n_init=10)
+    groups = kmeans.fit_predict(coords)
     
-    return splits
+    return groups
 
 
-def spatial_cv_score(model, X, y, h3_grid, scoring='f1'):
-    """Оценка модели с пространственной кросс-валидацией."""
-    splits = spatial_cross_validation(X, y, h3_grid, n_splits=5)
+def spatial_group_kfold_cv(model, X, y, groups, scoring='f1'):
+    """
+    Пространственная кросс-валидация с использованием GroupKFold.
+    Гарантирует, что соседние ячейки не попадают одновременно в train и test.
+    """
+    from sklearn.model_selection import GroupKFold
     
-    if len(splits) < 2:
-        print("⚠️ Недостаточно пространственных фолдов с положительными примерами")
-        return [], 0.0
+    gkf = GroupKFold(n_splits=config.ML_CONFIG['spatial_cv_n_splits'])
     
     scores = []
-    for train_idx, test_idx in splits:
+    for train_idx, test_idx in gkf.split(X, y, groups):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         
-        model_clone = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
-        
-        try:
-            model_clone.fit(X_train, y_train)
-            y_pred = model_clone.predict(X_test)
-            
-            if scoring == 'f1':
-                score = f1_score(y_test, y_pred, zero_division=0)
-            elif scoring == 'accuracy':
-                score = accuracy_score(y_test, y_pred)
-            else:
-                score = f1_score(y_test, y_pred, zero_division=0)
-            
-            scores.append(score)
-        except Exception as e:
-            print(f"   ⚠️ Ошибка в фолде: {e}")
+        # Проверяем наличие положительных примеров
+        if y_train.sum() == 0 or y_test.sum() == 0:
             continue
+        
+        # Обучаем с SMOTE
+        try:
+            smote = SMOTE(k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+                         random_state=42)
+            X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+        except:
+            X_train_res, y_train_res = X_train, y_train
+        
+        model_clone = model.__class__(**model.get_params()) if hasattr(model, 'get_params') else model
+        model_clone.fit(X_train_res, y_train_res)
+        
+        y_pred = model_clone.predict(X_test)
+        
+        if scoring == 'f1':
+            score = f1_score(y_test, y_pred, zero_division=0)
+        elif scoring == 'precision':
+            score = precision_score(y_test, y_pred, zero_division=0)
+        elif scoring == 'recall':
+            score = recall_score(y_test, y_pred, zero_division=0)
+        else:
+            score = f1_score(y_test, y_pred, zero_division=0)
+        
+        scores.append(score)
     
-    return scores, np.mean(scores) if scores else 0.0
+    return np.mean(scores), np.std(scores)
 
-def objective_rf(trial, X, y, cv=3):
-    """Objective function for Random Forest optimization"""
-    params = {
-        'n_estimators': 50,
-        'max_depth': trial.suggest_int('max_depth', 3, 20),
-        'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
-        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
-        'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
-        'random_state': 42,
-        'n_jobs': -1
+
+def bootstrap_metrics(y_true, y_pred, y_proba, n_iterations=None, ci=None):
+    """
+    Bootstrap для оценки доверительных интервалов метрик.
+    
+    Returns:
+        dict: Метрики с CI
+    """
+    if n_iterations is None:
+        n_iterations = config.BUSINESS_CONFIG['bootstrap_n_iterations']
+    if ci is None:
+        ci = config.BUSINESS_CONFIG['bootstrap_ci']
+    
+    n_samples = len(y_true)
+    
+    metrics_boot = {
+        'f1': [], 'precision': [], 'recall': [], 'roc_auc': [], 'ap': []
     }
     
-    clf = RandomForestClassifier(**params)
+    for _ in range(n_iterations):
+        indices = np.random.choice(n_samples, n_samples, replace=True)
+        y_true_boot = y_true.iloc[indices] if hasattr(y_true, 'iloc') else y_true[indices]
+        y_pred_boot = y_pred[indices] if isinstance(y_pred, np.ndarray) else y_pred.iloc[indices]
+        y_proba_boot = y_proba[indices]
+        
+        # Пропускаем если только один класс
+        if len(np.unique(y_true_boot)) < 2:
+            continue
+        
+        metrics_boot['f1'].append(f1_score(y_true_boot, y_pred_boot, zero_division=0))
+        metrics_boot['precision'].append(precision_score(y_true_boot, y_pred_boot, zero_division=0))
+        metrics_boot['recall'].append(recall_score(y_true_boot, y_pred_boot, zero_division=0))
+        metrics_boot['roc_auc'].append(roc_auc_score(y_true_boot, y_proba_boot))
+        metrics_boot['ap'].append(average_precision_score(y_true_boot, y_proba_boot))
     
-    pipeline = ImbPipeline([
-        ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y.sum()-1))),
-        ('classifier', clf)
-    ])
+    # Расчёт CI
+    alpha = (1 - ci) / 2
+    results = {}
+    for metric, values in metrics_boot.items():
+        if values:
+            results[metric] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'ci_lower': np.percentile(values, alpha * 100),
+                'ci_upper': np.percentile(values, (1 - alpha) * 100),
+            }
     
-    scores = cross_val_score(pipeline, X, y, cv=cv, scoring='f1')
-    return scores.mean()
+    return results
 
-def objective_catboost(trial, X, y, cv=3):
-    """Objective function for CatBoost optimization"""
-    params = {
-        'iterations': 50,
-        'depth': trial.suggest_int('depth', 4, 10),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-2, 10, log=True),
-        'random_strength': trial.suggest_float('random_strength', 1e-2, 10, log=True),
-        'bagging_temperature': trial.suggest_float('bagging_temperature', 0, 1),
-        'border_count': trial.suggest_int('border_count', 32, 255),
-        'verbose': False,
-        'random_state': 42,
-        'allow_writing_files': False
-    }
+
+def precision_at_k(y_true, y_proba, k_values=None):
+    """
+    Precision@K — какая доля из топ-K предсказаний действительно положительные.
+    Критическая бизнес-метрика для задачи рекомендаций.
+    """
+    if k_values is None:
+        k_values = config.BUSINESS_CONFIG['precision_at_k']
     
-    clf = CatBoostClassifier(**params)
+    # Сортируем по вероятности
+    sorted_indices = np.argsort(y_proba)[::-1]
+    y_true_sorted = np.array(y_true)[sorted_indices]
     
-    pipeline = ImbPipeline([
-        ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y.sum()-1))),
-        ('classifier', clf)
-    ])
+    results = {}
+    for k in k_values:
+        if k > len(y_true):
+            k = len(y_true)
+        top_k_true = y_true_sorted[:k]
+        p_at_k = np.sum(top_k_true) / k
+        results[f'P@{k}'] = p_at_k
     
-    scores = cross_val_score(pipeline, X, y, cv=cv, scoring='f1')
-    return scores.mean()
+    return results
+
+
+def calculate_lift(y_true, y_proba, k_values=None):
+    """
+    Lift@K — во сколько раз модель лучше случайного выбора.
+    """
+    if k_values is None:
+        k_values = config.BUSINESS_CONFIG['precision_at_k']
+    
+    baseline = np.mean(y_true)  # Базовая вероятность
+    p_at_k = precision_at_k(y_true, y_proba, k_values)
+    
+    results = {}
+    for key, value in p_at_k.items():
+        k = int(key.split('@')[1])
+        lift = value / baseline if baseline > 0 else 0
+        results[f'Lift@{k}'] = lift
+    
+    return results
+
+
+def expected_value_analysis(y_proba, potential_scores):
+    """
+    Расчёт ожидаемой ценности локаций.
+    
+    Simplified model:
+    EV = P(success) * potential_score * avg_revenue * location_impact
+    """
+    avg_revenue = config.BUSINESS_CONFIG['avg_pharmacy_revenue_monthly']
+    impact = config.BUSINESS_CONFIG['location_quality_impact']
+    
+    # Нормализуем potential_scores
+    pot_norm = (potential_scores - potential_scores.min()) / (potential_scores.max() - potential_scores.min() + 1e-10)
+    
+    # EV = вероятность * качество * базовая выручка * влияние качества
+    ev = y_proba * pot_norm * avg_revenue * (1 + impact * pot_norm)
+    
+    return ev
+
 
 def train_baseline_model(X, y):
     """Обучение baseline модели (Logistic Regression) для сравнения."""
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, 
         test_size=config.ML_CONFIG['test_size'], 
-        stratify=y, 
-        random_state=config.ML_CONFIG['random_state']
+        random_state=config.ML_CONFIG['random_state'],
+        stratify=y
     )
     
-    print("\n📊 Обучение Baseline модели (Logistic Regression)...")
     print(f"   Размер обучающей выборки: {len(y_train)} (положительных: {y_train.sum()})")
+    
+    # SMOTETomek — комбинация oversampling и cleaning
+    if config.ML_CONFIG.get('use_tomek_links', False):
+        resampler = SMOTETomek(
+            smote=SMOTE(k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+                       random_state=42),
+            random_state=42
+        )
+    else:
+        resampler = SMOTE(
+            k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+            random_state=42
+        )
     
     pipeline = ImbPipeline([
         ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y_train.sum()-1))),
-        ('classifier', LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'))
+        ('resampler', resampler),
+        ('classifier', LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'))
     ])
     
     pipeline.fit(X_train, y_train)
@@ -201,36 +292,105 @@ def train_baseline_model(X, y):
     
     cv_scores = cross_val_score(pipeline, X_train, y_train, cv=5, scoring='f1')
     
-    results = {
-        'model': pipeline,
-        'f1': f1_score(y_test, y_pred),
+    metrics = {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'precision': precision_score(y_test, y_pred, zero_division=0),
+        'recall': recall_score(y_test, y_pred, zero_division=0),
+        'f1': f1_score(y_test, y_pred, zero_division=0),
+        'roc_auc': roc_auc_score(y_test, y_proba) if y_test.sum() > 0 else 0,
         'cv_f1_mean': cv_scores.mean(),
         'cv_f1_std': cv_scores.std(),
-        'metrics': {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred, zero_division=0),
-            'recall': recall_score(y_test, y_pred, zero_division=0),
-            'roc_auc': roc_auc_score(y_test, y_proba) if len(np.unique(y_test)) > 1 else 0.0
-        },
-        'y_test': y_test,
-        'y_pred': y_pred,
-        'y_proba': y_proba
     }
     
-    print(f"   ✓ Baseline F1: {results['f1']:.4f}")
-    print(f"   ✓ Baseline CV F1: {results['cv_f1_mean']:.4f} ± {results['cv_f1_std']:.4f}")
-    print(f"   ✓ Baseline ROC AUC: {results['metrics']['roc_auc']:.4f}")
+    print(f"  ✓ Baseline F1: {metrics['f1']:.4f} (CV: {metrics['cv_f1_mean']:.4f} ± {metrics['cv_f1_std']:.4f})")
     
-    return pipeline, results
+    return pipeline, metrics, X_test, y_test, y_pred, y_proba
+
+
+def objective_rf(trial, X_train, y_train, cv_folds):
+    """Optuna objective для Random Forest"""
+    params = {
+        'n_estimators': config.ML_CONFIG['rf_n_estimators'],
+        'max_depth': trial.suggest_int('max_depth', *config.ML_CONFIG['rf_max_depth_range']),
+        'min_samples_split': trial.suggest_int('min_samples_split', *config.ML_CONFIG['rf_min_samples_split_range']),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', *config.ML_CONFIG['rf_min_samples_leaf_range']),
+        'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+        'class_weight': 'balanced',
+        'random_state': 42,
+        'n_jobs': -1
+    }
+    
+    clf = RandomForestClassifier(**params)
+    
+    if config.ML_CONFIG.get('use_tomek_links', False):
+        resampler = SMOTETomek(
+            smote=SMOTE(k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+                       random_state=42),
+            random_state=42
+        )
+    else:
+        resampler = SMOTE(
+            k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+            random_state=42
+        )
+    
+    pipeline = ImbPipeline([
+        ('scaler', StandardScaler()),
+        ('resampler', resampler),
+        ('classifier', clf)
+    ])
+    
+    scores = cross_val_score(pipeline, X_train, y_train, cv=cv_folds, scoring='f1')
+    return scores.mean()
+
+
+def objective_catboost(trial, X_train, y_train, cv_folds):
+    """Optuna objective для CatBoost"""
+    params = {
+        'iterations': config.ML_CONFIG['cb_iterations'],
+        'depth': trial.suggest_int('depth', *config.ML_CONFIG['cb_depth_range']),
+        'learning_rate': trial.suggest_float('learning_rate', *config.ML_CONFIG['cb_learning_rate_range'], log=True),
+        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', *config.ML_CONFIG['cb_l2_leaf_reg_range'], log=True),
+        'random_strength': trial.suggest_float('random_strength', 0.1, 10, log=True),
+        'bagging_temperature': trial.suggest_float('bagging_temperature', 0.0, 1.0),
+        'border_count': trial.suggest_categorical('border_count', [32, 64, 128, 255]),
+        'auto_class_weights': 'Balanced',
+        'random_seed': 42,
+        'verbose': False
+    }
+    
+    if config.ML_CONFIG.get('use_tomek_links', False):
+        resampler = SMOTETomek(
+            smote=SMOTE(k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+                       random_state=42),
+            random_state=42
+        )
+    else:
+        resampler = SMOTE(
+            k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+            random_state=42
+        )
+    
+    pipeline = ImbPipeline([
+        ('scaler', StandardScaler()),
+        ('resampler', resampler),
+        ('classifier', CatBoostClassifier(**params))
+    ])
+    
+    scores = cross_val_score(pipeline, X_train, y_train, cv=cv_folds, scoring='f1')
+    return scores.mean()
 
 
 def train_models(X, y, h3_grid=None, use_spatial_cv=False):
-    """Обучение моделей с оптимизацией гиперпараметров через Optuna."""
+    """
+    Обучение моделей с оптимизацией гиперпараметров через Optuna.
+    Включает калибровку вероятностей и расчёт бизнес-метрик.
+    """
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, 
         test_size=config.ML_CONFIG['test_size'], 
-        stratify=y, 
-        random_state=config.ML_CONFIG['random_state']
+        random_state=config.ML_CONFIG['random_state'],
+        stratify=y
     )
     
     print(f"Обучение моделей. Баланс классов в обучении: {Counter(y_train)}")
@@ -239,154 +399,206 @@ def train_models(X, y, h3_grid=None, use_spatial_cv=False):
     
     if len(y_test) < 20 or y_test.sum() < 3:
         print("⚠️ ВНИМАНИЕ: Тестовая выборка очень маленькая. Метрики могут быть ненадежными.")
-        print("   Рекомендуется использовать кросс-валидацию для оценки качества.")
+        print("   Рекомендуется использовать bootstrap CI для оценки неопределённости.")
     
     results = {}
     best_model = None
-    best_score = -1
+    best_f1 = 0
     best_name = ""
     
     n_trials = config.ML_CONFIG['optuna_trials']
     cv_folds = config.ML_CONFIG['optuna_cv_folds']
+    
+    # --- Baseline ---
     print("\n📊 Обучение Baseline модели (Logistic Regression)...")
-    baseline_pipeline = ImbPipeline([
-        ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y_train.sum()-1))),
-        ('classifier', LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'))
-    ])
+    baseline_pipeline, baseline_metrics, _, _, baseline_pred, baseline_proba = train_baseline_model(X, y)
+    results['Baseline (LogReg)'] = baseline_metrics
+    results['Baseline (LogReg)']['y_proba'] = baseline_proba
+    results['Baseline (LogReg)']['y_pred'] = baseline_pred
     
-    baseline_pipeline.fit(X_train, y_train)
-    y_pred_baseline = baseline_pipeline.predict(X_test)
-    y_proba_baseline = baseline_pipeline.predict_proba(X_test)[:, 1]
-    f1_baseline = f1_score(y_test, y_pred_baseline)
-    cv_scores_baseline = cross_val_score(baseline_pipeline, X_train, y_train, cv=cv_folds, scoring='f1')
-    
-    results['Baseline (LogReg)'] = {
-        'model': baseline_pipeline,
-        'f1': f1_baseline,
-        'cv_f1_mean': cv_scores_baseline.mean(),
-        'cv_f1_std': cv_scores_baseline.std(),
-        'metrics': {
-            'accuracy': accuracy_score(y_test, y_pred_baseline),
-            'precision': precision_score(y_test, y_pred_baseline, zero_division=0),
-            'recall': recall_score(y_test, y_pred_baseline, zero_division=0),
-            'roc_auc': roc_auc_score(y_test, y_proba_baseline) if len(np.unique(y_test)) > 1 else 0.0
-        },
-        'y_pred': y_pred_baseline,
-        'y_proba': y_proba_baseline
-    }
-    
-    print(f"  ✓ Baseline F1: {f1_baseline:.4f} (CV: {cv_scores_baseline.mean():.4f} ± {cv_scores_baseline.std():.4f})")
-    
-    if f1_baseline > best_score:
-        best_score = f1_baseline
+    if baseline_metrics['f1'] > best_f1:
+        best_f1 = baseline_metrics['f1']
         best_model = baseline_pipeline
         best_name = 'Baseline (LogReg)'
     
     # --- Random Forest ---
     print(f"\n🔍 Оптимизация Random Forest с Optuna ({n_trials} trials)...")
     study_rf = optuna.create_study(direction='maximize')
-    study_rf.optimize(lambda trial: objective_rf(trial, X_train, y_train, cv=cv_folds), n_trials=n_trials)
+    study_rf.optimize(lambda trial: objective_rf(trial, X_train, y_train, cv_folds), 
+                      n_trials=n_trials, show_progress_bar=False)
     
-    print(f"  Лучшие параметры RF: {study_rf.best_params}")
+    best_params_rf = study_rf.best_params
+    print(f"  Лучшие параметры RF: {best_params_rf}")
     print(f"  Лучший CV F1: {study_rf.best_value:.4f}")
     
-    rf_params = study_rf.best_params
-    rf_params['n_estimators'] = 1000
-    rf_params['random_state'] = 42
-    rf_params['n_jobs'] = -1
+    # Resampler
+    if config.ML_CONFIG.get('use_tomek_links', False):
+        resampler = SMOTETomek(
+            smote=SMOTE(k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+                       random_state=42),
+            random_state=42
+        )
+    else:
+        resampler = SMOTE(
+            k_neighbors=min(config.ML_CONFIG['smote_k_neighbors'], y_train.sum()-1),
+            random_state=42
+        )
+    
+    rf_clf = RandomForestClassifier(
+        n_estimators=config.ML_CONFIG['rf_n_estimators'],
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1,
+        **best_params_rf
+    )
     
     rf_pipeline = ImbPipeline([
         ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y_train.sum()-1))),
-        ('classifier', RandomForestClassifier(**rf_params))
+        ('resampler', resampler),
+        ('classifier', rf_clf)
     ])
     
     rf_pipeline.fit(X_train, y_train)
     y_pred_rf = rf_pipeline.predict(X_test)
+    y_proba_rf = rf_pipeline.predict_proba(X_test)[:, 1]
     f1_rf = f1_score(y_test, y_pred_rf)
     
     cv_scores_rf = cross_val_score(rf_pipeline, X_train, y_train, cv=cv_folds, scoring='f1')
     
-    y_proba_rf = rf_pipeline.predict_proba(X_test)[:, 1]
-    
     results['RandomForest'] = {
-        'model': rf_pipeline,
+        'accuracy': accuracy_score(y_test, y_pred_rf),
+        'precision': precision_score(y_test, y_pred_rf, zero_division=0),
+        'recall': recall_score(y_test, y_pred_rf, zero_division=0),
         'f1': f1_rf,
+        'roc_auc': roc_auc_score(y_test, y_proba_rf) if y_test.sum() > 0 else 0,
         'cv_f1_mean': cv_scores_rf.mean(),
         'cv_f1_std': cv_scores_rf.std(),
-        'metrics': {
-            'accuracy': accuracy_score(y_test, y_pred_rf),
-            'precision': precision_score(y_test, y_pred_rf, zero_division=0),
-            'recall': recall_score(y_test, y_pred_rf, zero_division=0),
-            'roc_auc': roc_auc_score(y_test, y_proba_rf) if len(np.unique(y_test)) > 1 else 0.0
-        },
-        'y_pred': y_pred_rf,
-        'y_proba': y_proba_rf
+        'y_proba': y_proba_rf,
+        'y_pred': y_pred_rf
     }
     
-    if f1_rf > best_score:
-        best_score = f1_rf
+    if f1_rf > best_f1:
+        best_f1 = f1_rf
         best_model = rf_pipeline
         best_name = 'RandomForest'
-
+    
+    # --- CatBoost ---
     print(f"\n🔍 Оптимизация CatBoost с Optuna ({n_trials} trials)...")
     study_cb = optuna.create_study(direction='maximize')
-    study_cb.optimize(lambda trial: objective_catboost(trial, X_train, y_train, cv=cv_folds), n_trials=n_trials)
+    study_cb.optimize(lambda trial: objective_catboost(trial, X_train, y_train, cv_folds),
+                      n_trials=n_trials, show_progress_bar=False)
     
-    print(f"  Лучшие параметры CatBoost: {study_cb.best_params}")
+    best_params_cb = study_cb.best_params
+    print(f"  Лучшие параметры CatBoost: {best_params_cb}")
     print(f"  Лучший CV F1: {study_cb.best_value:.4f}")
     
-    cb_params = study_cb.best_params
-    cb_params['iterations'] = 1000
-    cb_params['verbose'] = False
-    cb_params['random_state'] = 42
-    cb_params['allow_writing_files'] = False
+    cb_clf = CatBoostClassifier(
+        iterations=config.ML_CONFIG['cb_iterations'],
+        auto_class_weights='Balanced',
+        random_seed=42,
+        verbose=False,
+        **best_params_cb
+    )
     
     cb_pipeline = ImbPipeline([
         ('scaler', StandardScaler()),
-        ('sampler', SMOTE(random_state=42, k_neighbors=min(5, y_train.sum()-1))),
-        ('classifier', CatBoostClassifier(**cb_params))
+        ('resampler', resampler),
+        ('classifier', cb_clf)
     ])
     
     cb_pipeline.fit(X_train, y_train)
     y_pred_cb = cb_pipeline.predict(X_test)
+    y_proba_cb = cb_pipeline.predict_proba(X_test)[:, 1]
     f1_cb = f1_score(y_test, y_pred_cb)
     
     cv_scores_cb = cross_val_score(cb_pipeline, X_train, y_train, cv=cv_folds, scoring='f1')
     
-    y_proba_cb = cb_pipeline.predict_proba(X_test)[:, 1]
-    
     results['CatBoost'] = {
-        'model': cb_pipeline,
+        'accuracy': accuracy_score(y_test, y_pred_cb),
+        'precision': precision_score(y_test, y_pred_cb, zero_division=0),
+        'recall': recall_score(y_test, y_pred_cb, zero_division=0),
         'f1': f1_cb,
+        'roc_auc': roc_auc_score(y_test, y_proba_cb) if y_test.sum() > 0 else 0,
         'cv_f1_mean': cv_scores_cb.mean(),
         'cv_f1_std': cv_scores_cb.std(),
-        'metrics': {
-            'accuracy': accuracy_score(y_test, y_pred_cb),
-            'precision': precision_score(y_test, y_pred_cb, zero_division=0),
-            'recall': recall_score(y_test, y_pred_cb, zero_division=0),
-            'roc_auc': roc_auc_score(y_test, y_proba_cb) if len(np.unique(y_test)) > 1 else 0.0
-        },
-        'y_pred': y_pred_cb,
-        'y_proba': y_proba_cb
+        'y_proba': y_proba_cb,
+        'y_pred': y_pred_cb
     }
     
-    if f1_cb == 1.0 and len(y_test) < 10:
-        print("⚠️ ВНИМАНИЕ: F1=1.0 на маленькой тестовой выборке может указывать на переобучение.")
-        print(f"   CV F1 (более объективная оценка): {cv_scores_cb.mean():.4f} ± {cv_scores_cb.std():.4f}")
-    
-    if f1_cb > best_score:
-        best_score = f1_cb
+    if f1_cb > best_f1:
+        best_f1 = f1_cb
         best_model = cb_pipeline
         best_name = 'CatBoost'
-            
-    print(f"\n🏆 Лучшая модель: {best_name} (F1 на тесте={best_score:.4f})")
     
-    best_metrics = results[best_name]['metrics']
-    print("Метрики на тестовой выборке:")
-    for m, v in best_metrics.items():
-        print(f"  {m}: {v:.4f}")
+    # Предупреждение о переобучении
+    if f1_cb == 1.0 and len(y_test) < 10:
+        print("⚠️ ВНИМАНИЕ: F1=1.0 на маленькой тестовой выборке может указывать на переобучение.")
+    
+    print(f"\n🏆 Лучшая модель: {best_name} (F1 на тесте={best_f1:.4f})")
+    
+    # --- Калибровка вероятностей ---
+    print("\n🔧 Калибровка вероятностей...")
+    try:
+        calibrated_model = CalibratedClassifierCV(
+            best_model, 
+            method=config.ML_CONFIG['calibration_method'],
+            cv=min(config.ML_CONFIG['calibration_cv'], y_train.sum())
+        )
+        calibrated_model.fit(X_train, y_train)
+        y_proba_calibrated = calibrated_model.predict_proba(X_test)[:, 1]
+        
+        # Проверяем улучшение по Brier Score
+        from sklearn.metrics import brier_score_loss
+        brier_before = brier_score_loss(y_test, results[best_name]['y_proba'])
+        brier_after = brier_score_loss(y_test, y_proba_calibrated)
+        
+        if brier_after < brier_before:
+            print(f"  ✓ Калибровка улучшила Brier Score: {brier_before:.4f} → {brier_after:.4f}")
+            best_model = calibrated_model
+            results[best_name]['y_proba_calibrated'] = y_proba_calibrated
+        else:
+            print(f"  ⚠️ Калибровка не улучшила модель (Brier: {brier_before:.4f} → {brier_after:.4f})")
+    except Exception as e:
+        print(f"  ⚠️ Ошибка калибровки: {e}")
+    
+    # --- Бизнес-метрики ---
+    print("\n📊 Расчёт бизнес-метрик...")
+    best_proba = results[best_name]['y_proba']
+    best_pred = results[best_name]['y_pred']
+    
+    # Precision@K
+    p_at_k = precision_at_k(y_test, best_proba)
+    print(f"  Precision@K: {p_at_k}")
+    results[best_name]['precision_at_k'] = p_at_k
+    
+    # Lift
+    lift = calculate_lift(y_test, best_proba)
+    print(f"  Lift@K: {lift}")
+    results[best_name]['lift'] = lift
+    
+    # Bootstrap CI
+    if len(y_test) >= 10:
+        print("  Расчёт Bootstrap CI (это может занять время)...")
+        bootstrap_results = bootstrap_metrics(y_test, best_pred, best_proba, n_iterations=500)
+        results[best_name]['bootstrap_ci'] = bootstrap_results
+        print(f"  F1 95% CI: [{bootstrap_results['f1']['ci_lower']:.4f}, {bootstrap_results['f1']['ci_upper']:.4f}]")
+    
+    # Spatial CV если доступен h3_grid
+    if h3_grid is not None and use_spatial_cv:
+        print("\n🗺️ Пространственная кросс-валидация...")
+        groups = get_district_groups(h3_grid)
+        spatial_mean, spatial_std = spatial_group_kfold_cv(
+            rf_clf, X, y, groups
+        )
+        print(f"  Spatial CV F1: {spatial_mean:.4f} ± {spatial_std:.4f}")
+        results[best_name]['spatial_cv_f1'] = spatial_mean
+        results[best_name]['spatial_cv_std'] = spatial_std
+    
+    # Сводка метрик
+    print(f"\n📈 Метрики на тестовой выборке ({best_name}):")
+    for m, v in results[best_name].items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            print(f"  {m}: {v:.4f}")
     
     if 'cv_f1_mean' in results[best_name]:
         print(f"\nКросс-валидация (CV) F1: {results[best_name]['cv_f1_mean']:.4f} ± {results[best_name]['cv_f1_std']:.4f}")
@@ -396,7 +608,7 @@ def train_models(X, y, h3_grid=None, use_spatial_cv=False):
         'y_test': y_test,
         'X_test': X_test
     }
-        
+    
     return best_model, results, X_test, y_test
 
 
@@ -420,14 +632,15 @@ def add_cluster_features(X, n_clusters=5):
     
     return X_with_clusters, cluster_labels, kmeans, scaler
 
+
 def analyze_clusters_optimal_k(X, max_k=10):
     """Анализ оптимального числа кластеров (Elbow Method и Silhouette)."""
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
+    K = range(2, max_k + 1)
     inertias = []
     silhouettes = []
-    K = range(2, max_k + 1)
     
     for k in K:
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -435,22 +648,22 @@ def analyze_clusters_optimal_k(X, max_k=10):
         inertias.append(kmeans.inertia_)
         silhouettes.append(silhouette_score(X_scaled, kmeans.labels_))
         
+    # Plot Elbow
     plt.figure(figsize=(10, 5))
     plt.plot(K, inertias, 'bx-')
-    plt.xlabel('Количество кластеров (k)')
-    plt.ylabel('Инерция (Inertia)')
-    plt.title('Метод локтя для выбора оптимального k')
-    plt.grid(True)
-    plt.savefig(config.FILES['elbow_plot'])
+    plt.xlabel('k')
+    plt.ylabel('Inertia')
+    plt.title('Elbow Method')
+    plt.savefig(config.FILES['elbow_plot'], dpi=100, bbox_inches='tight')
     plt.close()
     
+    # Plot Silhouette
     plt.figure(figsize=(10, 5))
     plt.plot(K, silhouettes, 'rx-')
-    plt.xlabel('Количество кластеров (k)')
-    plt.ylabel('Силуэтный коэффициент (Silhouette Score)')
-    plt.title('Анализ силуэта для выбора оптимального k')
-    plt.grid(True)
-    plt.savefig(config.FILES['silhouette_plot'])
+    plt.xlabel('k')
+    plt.ylabel('Silhouette Score')
+    plt.title('Silhouette Method')
+    plt.savefig(config.FILES['silhouette_plot'], dpi=100, bbox_inches='tight')
     plt.close()
     
     print(f"Графики анализа кластеров сохранены в {config.DATA_DIR}")
@@ -460,15 +673,17 @@ def analyze_clusters_optimal_k(X, max_k=10):
     
     return best_k
 
-def perform_clustering(X, n_clusters=5):
-    """Кластеризация территорий с использованием KMeans"""
+
+def perform_clustering(X, n_clusters):
+    """Выполнение кластеризации"""
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(X_scaled)
+    clusters = kmeans.fit_predict(X_scaled)
     
-    return labels, kmeans
+    return clusters, kmeans, scaler
+
 
 def save_model(model, filename, feature_names=None, exclude_leakage=False):
     """Сохранение модели с метаданными"""
@@ -497,8 +712,6 @@ def load_model(filename):
 def validate_on_region(model, X_val, y_val, region_name="Валидационный регион"):
     """
     Валидация модели на данных из другого региона (out-of-domain validation).
-    
-    Это самый честный способ оценки модели для геопространственных задач.
     """
     print(f"\n{'='*80}")
     print(f"🔬 ВАЛИДАЦИЯ НА НЕЗАВИСИМОМ РЕГИОНЕ: {region_name}")
@@ -507,11 +720,9 @@ def validate_on_region(model, X_val, y_val, region_name="Валидационн�
     print(f"\n📊 Размер валидационной выборки: {len(y_val)}")
     print(f"   Положительных примеров: {y_val.sum()} ({100*y_val.sum()/len(y_val):.1f}%)")
     
-    # Предсказания
     y_pred = model.predict(X_val)
     y_proba = model.predict_proba(X_val)[:, 1]
     
-    # Метрики
     metrics = {
         'accuracy': accuracy_score(y_val, y_pred),
         'precision': precision_score(y_val, y_pred, zero_division=0),
@@ -526,6 +737,14 @@ def validate_on_region(model, X_val, y_val, region_name="Валидационн�
     print(f"   Recall:    {metrics['recall']:.4f}")
     print(f"   F1-score:  {metrics['f1']:.4f}")
     print(f"   ROC AUC:   {metrics['roc_auc']:.4f}")
+    
+    # Бизнес-метрики
+    p_at_k = precision_at_k(y_val, y_proba)
+    lift = calculate_lift(y_val, y_proba)
+    
+    print(f"\n📊 Бизнес-метрики:")
+    print(f"   {p_at_k}")
+    print(f"   {lift}")
     
     # Интерпретация
     print(f"\n💡 Интерпретация:")

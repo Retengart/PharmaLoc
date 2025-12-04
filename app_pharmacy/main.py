@@ -15,6 +15,7 @@ from . import modeling
 from . import analysis
 from . import visualization
 from . import parallel_processing
+from . import data_mos
 
 
 def parse_args():
@@ -30,6 +31,7 @@ def parse_args():
   python3 -m app_pharmacy.main --skip-data        # Пропустить загрузку данных (использовать кэш)
   python3 -m app_pharmacy.main --train --no-leakage  # Обучить без "утекающих" признаков
   python3 -m app_pharmacy.main --validate         # Валидация на другом округе (ЗАО)
+  python3 -m app_pharmacy.main --enrich           # Обогатить данными из data.mos.ru
         """
     )
     
@@ -46,6 +48,9 @@ def parse_args():
     
     parser.add_argument('--no-leakage', action='store_true',
                        help='Исключить признаки с утечкой данных (pharmacy_*) для честной оценки')
+    
+    parser.add_argument('--enrich', action='store_true',
+                       help='Обогатить данные из портала data.mos.ru (медучреждения, ТПУ, демография)')
     
     return parser.parse_args()
 
@@ -281,6 +286,14 @@ def main():
         
         h3_grid = parallel_processing.parallel_target_variable(h3_grid, osm_data.get('pharmacies'))
         
+        # Обогащение данными из data.mos.ru (опционально)
+        if args.enrich or config.DATA_MOS_CONFIG.get('enabled', False):
+            print("\n📊 Обогащение данными из data.mos.ru...")
+            try:
+                h3_grid = data_mos.enrich_h3_grid_with_mos_data(h3_grid, osm_data)
+            except Exception as e:
+                print(f"  ⚠️ Ошибка интеграции data.mos.ru: {e}")
+        
         print(f"\n✓ Признаки рассчитаны")
         print(f"  - Всего признаков: {len([c for c in h3_grid.columns if c not in ['h3_cell', 'geometry', 'center_lat', 'center_lon', 'has_pharmacy']])}")
         print(f"  - Ячеек с аптеками: {h3_grid['has_pharmacy'].sum()} ({h3_grid['has_pharmacy'].mean()*100:.1f}%)")
@@ -338,6 +351,28 @@ def main():
     cluster_profiles, cluster_descriptions = analysis.describe_clusters(h3_grid, cluster_col='cluster')
 
     print("\n" + "="*80)
+    print("🔬 ЭТАП 4.5: АНАЛИЗ МУЛЬТИКОЛЛИНЕАРНОСТИ (VIF)")
+    print("="*80)
+    
+    # VIF анализ
+    print("\n📊 Расчёт VIF для обнаружения мультиколлинеарности...")
+    try:
+        vif_df = features.calculate_vif(X_cluster)
+        visualization.plot_vif_analysis(vif_df)
+        
+        # Удаление высококоррелированных признаков
+        print("\n📊 Удаление высококоррелированных признаков...")
+        X_cluster_clean_corr, removed_corr = features.remove_highly_correlated_features(X_cluster)
+        
+        high_vif_count = (vif_df['VIF'] > config.FEATURE_CONFIG['vif_threshold']).sum()
+        if high_vif_count > 0:
+            print(f"⚠️ Найдено {high_vif_count} признаков с VIF > {config.FEATURE_CONFIG['vif_threshold']}")
+    except Exception as e:
+        print(f"⚠️ Ошибка VIF анализа: {e}")
+        X_cluster_clean_corr = X_cluster
+        removed_corr = []
+    
+    print("\n" + "="*80)
     print("🤖 ЭТАП 5: МАШИННОЕ ОБУЧЕНИЕ")
     print("="*80)
     
@@ -350,10 +385,12 @@ def main():
         if exclude_leakage:
             print("\n🔒 Режим без утечки данных (--no-leakage)")
             feature_cols_clean = modeling.filter_leakage_features(feature_cols, exclude_leakage=True)
+            # Также исключаем высококоррелированные
+            feature_cols_clean = [c for c in feature_cols_clean if c not in removed_corr]
             X_cluster_clean, _ = modeling.prepare_data(h3_grid, feature_cols_clean)
         else:
-            feature_cols_clean = feature_cols
-            X_cluster_clean = X_cluster
+            feature_cols_clean = [c for c in feature_cols if c not in removed_corr]
+            X_cluster_clean = X_cluster_clean_corr
         
         print("\n📊 Добавление кластерных признаков...")
         X_with_clusters, _, _, _ = modeling.add_cluster_features(X_cluster_clean, n_clusters=best_k)
@@ -433,6 +470,14 @@ def main():
             
             print("\n📊 Анализ важности признаков...")
             visualization.plot_feature_importance(best_model, feature_cols_extended)
+            
+            # Визуализация бизнес-метрик
+            best_model_name = max(
+                [k for k in results.keys() if not k.startswith('_')],
+                key=lambda k: results[k].get('f1', 0)
+            )
+            print("\n📊 Визуализация бизнес-метрик...")
+            visualization.plot_business_metrics(results[best_model_name], model_name=best_model_name)
         else:
             print("\n📊 Этап 6 пропущен (модель загружена из кэша)")
         

@@ -87,7 +87,9 @@ def calculate_potential(h3_grid, weights=config.POTENTIAL_WEIGHTS):
     )
     
     if 'prediction_score' in h3_grid.columns:
-        h3_grid['potential_score'] = 0.6 * score + 0.4 * h3_grid['prediction_score']
+        rule_w = config.POTENTIAL_BLEND['rule_weight']
+        ml_w = config.POTENTIAL_BLEND['ml_weight']
+        h3_grid['potential_score'] = rule_w * score + ml_w * h3_grid['prediction_score']
     else:
         h3_grid['potential_score'] = score
         
