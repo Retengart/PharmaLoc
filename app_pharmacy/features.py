@@ -2,6 +2,7 @@
 Модуль генерации признаков для геомаркетингового анализа.
 """
 import h3
+import pandas as pd
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import Polygon
@@ -274,7 +275,7 @@ def calculate_vif(X):
         try:
             vif = variance_inflation_factor(X_clean.values, i)
             vif_data.append({'feature': col, 'VIF': vif})
-        except:
+        except Exception:
             vif_data.append({'feature': col, 'VIF': np.inf})
     
     vif_df = pd.DataFrame(vif_data).sort_values('VIF', ascending=False)
@@ -292,7 +293,6 @@ def remove_high_vif_features(X, threshold=None):
     Returns:
         X_filtered, removed_features
     """
-    import pandas as pd
     
     if threshold is None:
         threshold = config.FEATURE_CONFIG['vif_threshold']
@@ -320,7 +320,3 @@ def remove_high_vif_features(X, threshold=None):
             print(f"   ... и ещё {len(removed) - 5}")
     
     return X_work, removed
-
-
-# Импорт pandas для calculate_vif
-import pandas as pd

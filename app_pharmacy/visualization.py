@@ -556,9 +556,6 @@ def plot_cluster_pca(X, cluster_labels, filename='cluster_pca.png'):
     axes[0].legend(loc='best')
     axes[0].grid(True, alpha=0.3)
     
-    cumulative_var = np.cumsum(pca.explained_variance_ratio_)
-    n_components = min(10, len(pca.explained_variance_ratio_))
-    
     pca_full = PCA(n_components=min(20, X_scaled.shape[1]))
     pca_full.fit(X_scaled)
     
@@ -614,8 +611,8 @@ def plot_cluster_profiles(df, cluster_col='cluster', features=None, filename='cl
     colors = plt.cm.Set1(np.linspace(0, 1, n_clusters))
     
     for i, (cluster, row) in enumerate(cluster_means_normalized.iterrows()):
-        bars = ax.bar(x + i * width, row.values, width, label=f'Кластер {cluster}', 
-                     color=colors[i], alpha=0.8)
+        ax.bar(x + i * width, row.values, width, label=f'Кластер {cluster}', 
+               color=colors[i], alpha=0.8)
     
     ax.set_ylabel('Нормализованное значение')
     ax.set_title('Профили кластеров', fontsize=14, fontweight='bold')
@@ -678,8 +675,8 @@ def plot_business_metrics(results, model_name='Best Model', filename='business_m
         metric_names = [m for m in metrics if m in boot]
         
         x = np.arange(len(metric_names))
-        errors = [[m - l for m, l in zip(means, lowers)],
-                  [u - m for m, u in zip(means, uppers)]]
+        errors = [[m - low for m, low in zip(means, lowers)],
+                  [up - m for m, up in zip(means, uppers)]]
         
         axes[2].bar(x, means, yerr=errors, color='#9b59b6', alpha=0.8, 
                    edgecolor='black', capsize=5)
@@ -717,7 +714,7 @@ def plot_vif_analysis(vif_df, threshold=None, filename='vif_analysis.png'):
     
     colors = ['#e74c3c' if v > threshold else '#2ecc71' for v in vif_top['VIF']]
     
-    bars = ax.barh(range(len(vif_top)), vif_top['VIF'], color=colors, alpha=0.8, edgecolor='black')
+    ax.barh(range(len(vif_top)), vif_top['VIF'], color=colors, alpha=0.8, edgecolor='black')
     
     ax.axvline(x=threshold, color='red', linestyle='--', linewidth=2, 
                label=f'Порог VIF = {threshold}')

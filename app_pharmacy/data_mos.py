@@ -11,7 +11,6 @@ import requests
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-import json
 import os
 from . import config
 
@@ -312,7 +311,7 @@ def enrich_h3_grid_with_mos_data(h3_grid, osm_data=None):
             # Определяем округ для каждой ячейки (упрощённо по координатам)
             # В реальности нужно использовать границы округов
             h3_grid['mos_population_available'] = True
-            print(f"  ✓ Демографические данные доступны")
+            print("  ✓ Демографические данные доступны")
     except Exception as e:
         print(f"  ⚠️ Ошибка загрузки демографии: {e}")
     
@@ -361,7 +360,7 @@ if __name__ == '__main__':
     pop = load_population_by_district()
     salaries = load_average_salaries()
     
-    print(f"\nИтого:")
+    print("\nИтого:")
     print(f"  Медучреждений: {len(medical)}")
     print(f"  ТПУ: {len(tpu)}")
     print(f"  Округов с демографией: {len(pop)}")

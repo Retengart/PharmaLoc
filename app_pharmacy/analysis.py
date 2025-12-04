@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 import json
 import os
 from datetime import datetime
@@ -315,8 +314,6 @@ def describe_clusters(h3_grid, cluster_col='cluster', feature_cols=None):
     
     available_key_features = {k: v for k, v in key_features.items() if k in feature_cols}
     
-    cluster_stats = h3_grid.groupby(cluster_col)[feature_cols].agg(['mean', 'std', 'median'])
-    
     cluster_means = h3_grid.groupby(cluster_col)[feature_cols].mean()
     overall_means = h3_grid[feature_cols].mean()
     overall_stds = h3_grid[feature_cols].std()
@@ -425,7 +422,6 @@ def get_cluster_recommendations(h3_grid, cluster_col='cluster'):
         
         if 'potential_score' in cluster_data.columns:
             avg_potential = cluster_data['potential_score'].mean()
-            high_potential_count = (cluster_data['potential_score'] > 0.6).sum()
             
             if avg_potential > 0.5:
                 rec['recommendations'].append("✅ Высокий потенциал — приоритетный кластер для размещения")

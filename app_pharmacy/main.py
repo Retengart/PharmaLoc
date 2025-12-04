@@ -3,7 +3,6 @@ import os
 import argparse
 import pandas as pd
 import geopandas as gpd
-import joblib
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -127,7 +126,7 @@ def run_validation_mode():
         
         # Генерируем признаки
         val_h3_grid = generate_all_features(val_h3_grid, val_osm_data)
-        print(f"✓ Сгенерированы признаки")
+        print("✓ Сгенерированы признаки")
         print(f"   Ячеек с аптеками: {val_h3_grid['has_pharmacy'].sum()}")
         
         # Подготавливаем данные
@@ -204,7 +203,7 @@ def main():
     
     if not args.train and not args.load:
         if model_exists:
-            print(f"\n📦 Найдена обученная модель:")
+            print("\n📦 Найдена обученная модель:")
             print(f"   Путь: {model_path}")
             print(f"   Дата: {model_time}")
             print(f"   Размер: {model_size:.2f} MB")
@@ -245,7 +244,6 @@ def main():
         h3_grid = None
     else:
         roi_geometry = None
-        gdf_district = None
     
     print("\n" + "="*80)
     print("🔧 ЭТАП 2: ГЕНЕРАЦИЯ ПРИЗНАКОВ (Feature Engineering)")
@@ -294,7 +292,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️ Ошибка интеграции data.mos.ru: {e}")
         
-        print(f"\n✓ Признаки рассчитаны")
+        print("\n✓ Признаки рассчитаны")
         print(f"  - Всего признаков: {len([c for c in h3_grid.columns if c not in ['h3_cell', 'geometry', 'center_lat', 'center_lon', 'has_pharmacy']])}")
         print(f"  - Ячеек с аптеками: {h3_grid['has_pharmacy'].sum()} ({h3_grid['has_pharmacy'].mean()*100:.1f}%)")
         
@@ -333,7 +331,7 @@ def main():
     print("\n🔍 Определение оптимального числа кластеров...")
     best_k = modeling.analyze_clusters_optimal_k(X_cluster, max_k=10)
     
-    cluster_labels, kmeans_model = modeling.perform_clustering(X_cluster, n_clusters=best_k)
+    cluster_labels, kmeans_model, _ = modeling.perform_clustering(X_cluster, n_clusters=best_k)
     h3_grid['cluster'] = cluster_labels
     
     print(f"\n✓ Кластеризация завершена (k={best_k})")
@@ -518,20 +516,20 @@ def main():
     print("="*80)
     
     print("\n📁 Сгенерированные файлы:")
-    print(f"  📊 Данные:")
+    print("  📊 Данные:")
     print(f"     - {config.FILES['h3_grid_features']}")
     print(f"     - {config.FILES['h3_grid_final']}")
     print(f"     - {config.FILES['top_10_summary']}")
-    print(f"  🤖 Модель:")
+    print("  🤖 Модель:")
     print(f"     - {config.FILES['model']}")
-    print(f"  📈 Визуализации:")
+    print("  📈 Визуализации:")
     print(f"     - {config.DATA_DIR}/correlation_matrix.png")
     print(f"     - {config.DATA_DIR}/feature_importance.png")
     print(f"     - {config.DATA_DIR}/roc_pr_*.png")
     print(f"     - {config.DATA_DIR}/confusion_matrix_*.png")
     print(f"     - {config.DATA_DIR}/models_comparison.png")
     print(f"     - {config.DATA_DIR}/cluster_*.png")
-    print(f"  🗺️ Карты:")
+    print("  🗺️ Карты:")
     print(f"     - {config.DATA_DIR}/potential_map.html")
     
     print("\n🎯 Основные результаты:")
