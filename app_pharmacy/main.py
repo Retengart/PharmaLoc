@@ -20,7 +20,7 @@ from . import data_mos
 def parse_args():
     """Парсинг аргументов командной строки"""
     parser = argparse.ArgumentParser(
-        description='Геомаркетинговый анализ для размещения аптек',
+        description='PharmaLoc: Геомаркетинговый анализ для размещения аптек',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
