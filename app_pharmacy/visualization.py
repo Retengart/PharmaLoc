@@ -1,5 +1,5 @@
 import folium
-from folium.plugins import HeatMap
+from folium.plugins import HeatMap, Fullscreen, MeasureControl, MousePosition
 from folium import LayerControl, FeatureGroup
 
 # Бэкенд без GUI для избежания конфликтов с многопоточностью
@@ -29,14 +29,31 @@ def create_base_map(roi_params):
     """Базовая карта"""
     m = folium.Map(
         location=[roi_params['center_lat'], roi_params['center_lon']],
-        zoom_start=14,
-        tiles='OpenStreetMap'
+        zoom_start=config.VIZ_CONFIG.get('map_zoom_start', 12),
+        tiles='OpenStreetMap',
+        control_scale=True
     )
     return m
 
 def create_potential_map(h3_grid, roi_params, competitors=None, recommendations=None, filename='potential_map.html'):
     """Создает карту потенциала с несколькими слоями и легендой."""
     m = create_base_map(roi_params)
+
+    # Полезные контролы
+    Fullscreen(position="topleft").add_to(m)
+    MeasureControl(
+        position="topleft",
+        primary_length_unit="meters",
+        secondary_length_unit="kilometers",
+        primary_area_unit="sqmeters",
+        secondary_area_unit="hectares",
+    ).add_to(m)
+    MousePosition(
+        position="bottomright",
+        separator=" | ",
+        prefix="Координаты",
+        num_digits=6,
+    ).add_to(m)
     
     heat_data = h3_grid[['center_lat', 'center_lon', 'potential_score']].dropna().values.tolist()
     hm_layer = FeatureGroup(name='Тепловая карта потенциала', show=True)
@@ -67,23 +84,82 @@ def create_potential_map(h3_grid, roi_params, competitors=None, recommendations=
         else:
             return '#d73027'
 
-    grid_layer = FeatureGroup(name='Сетка H3 (Детализация)', show=False)
-    
+    # Сетка H3: показываем только нужные поля, чтобы HTML не раздувался
+    grid_layer = FeatureGroup(name='Сетка H3 (клики + детали)', show=False)
+
+    field_alias_pairs = [
+        ('h3_cell', 'H3 ID'),
+        ('potential_score', 'Потенциал'),
+        ('prediction_score', 'ML вероятность'),
+        ('has_pharmacy', 'Есть аптека'),
+        ('cluster', 'Кластер'),
+        ('pharmacy_nearest_distance', 'Ближайшая аптека (м)'),
+        ('medical_nearest_distance', 'Ближайшая медицина (м)'),
+        ('medical_synergy', 'Медицинская синергия'),
+        ('residential_coverage', 'Покрытие жильём'),
+        ('office_coverage', 'Покрытие офисами'),
+        ('road_density', 'Плотность дорог (км/км²)'),
+    ]
+    fields = [f for f, _ in field_alias_pairs if f in h3_grid.columns]
+    aliases = [a + ":" for f, a in field_alias_pairs if f in h3_grid.columns]
+
+    # Минимальный набор колонок в GeoJSON
+    grid_cols = list(dict.fromkeys(fields + ['center_lat', 'center_lon', 'geometry']))
+    grid_gdf = h3_grid[[c for c in grid_cols if c in h3_grid.columns]].copy()
+
     folium.GeoJson(
-        h3_grid.to_json(),
+        grid_gdf.to_json(),
         style_function=lambda feature: {
             'fillColor': get_color_green_high(feature['properties'].get('potential_score', 0)),
-            'color': 'gray',
+            'color': '#666',
             'weight': 1,
-            'fillOpacity': 0.6
+            'fillOpacity': 0.55
+        },
+        highlight_function=lambda feature: {
+            'weight': 3,
+            'color': '#000',
+            'fillOpacity': 0.75
         },
         tooltip=folium.GeoJsonTooltip(
-            fields=['h3_cell', 'potential_score', 'has_pharmacy', 'cluster'],
-            aliases=['H3 ID:', 'Потенциал:', 'Есть аптека:', 'Кластер:'],
-            localize=True
+            fields=fields[:4] if len(fields) >= 4 else fields,
+            aliases=aliases[:4] if len(aliases) >= 4 else aliases,
+            localize=True,
+            sticky=False
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=fields,
+            aliases=aliases,
+            localize=True,
+            labels=True,
+            style="background-color: white;"
         )
     ).add_to(grid_layer)
     grid_layer.add_to(m)
+
+    # Полигоны топ-рекомендаций (чтобы было видно границы H3 ячеек)
+    if recommendations:
+        rec_poly_layer = FeatureGroup(name='Топ-рекомендации (полигоны)', show=True)
+        rank_by_cell = {r['h3_cell']: r.get('rank') for r in recommendations if 'h3_cell' in r}
+        rec_cells = [c for c in rank_by_cell.keys() if c in set(h3_grid['h3_cell'])]
+        if rec_cells:
+            rec_gdf = h3_grid[h3_grid['h3_cell'].isin(rec_cells)][['h3_cell', 'potential_score', 'geometry']].copy()
+            rec_gdf['rank'] = rec_gdf['h3_cell'].map(rank_by_cell)
+
+            folium.GeoJson(
+                rec_gdf.to_json(),
+                style_function=lambda feature: {
+                    'fillColor': '#1a9850',
+                    'color': '#1a9850',
+                    'weight': 3,
+                    'fillOpacity': 0.15
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=[c for c in ['rank', 'potential_score', 'h3_cell'] if c in rec_gdf.columns],
+                    aliases=['Ранг:', 'Потенциал:', 'H3 ID:'],
+                    localize=True
+                )
+            ).add_to(rec_poly_layer)
+            rec_poly_layer.add_to(m)
     
     if competitors is not None and not competitors.empty:
         comp_layer = FeatureGroup(name='Конкуренты (Аптеки)', show=True)
@@ -98,6 +174,19 @@ def create_potential_map(h3_grid, roi_params, competitors=None, recommendations=
                 popup='Конкурент'
             ).add_to(comp_layer)
         comp_layer.add_to(m)
+
+        # Доп. слой: теплокарта конкурентов (полезно вместо точек на больших масштабах)
+        try:
+            comp_heat = []
+            for _, row in competitors.iterrows():
+                pt = row.geometry if row.geometry.geom_type == 'Point' else row.geometry.centroid
+                comp_heat.append([pt.y, pt.x, 1.0])
+            if comp_heat:
+                comp_heat_layer = FeatureGroup(name='Конкуренты (тепловая карта)', show=False)
+                HeatMap(comp_heat, radius=10, blur=8, max_zoom=1).add_to(comp_heat_layer)
+                comp_heat_layer.add_to(m)
+        except Exception:
+            pass
         
     rec_coords = []
     if recommendations:
@@ -227,6 +316,25 @@ def create_potential_map(h3_grid, roi_params, competitors=None, recommendations=
      '''
     m.get_root().html.add_child(folium.Element(legend_html))
 
+    # Брендинг/подпись в атрибуции (вместо "Leaflet ...").
+    # ВАЖНО: атрибуцию OpenStreetMap оставляем (требование лицензии данных/тайлов).
+    try:
+        map_var = m.get_name()
+        # ВАЖНО: НЕ добавляем <script>...</script>, т.к. Folium уже оборачивает script-контейнер.
+        # Также откладываем выполнение, чтобы переменная map_* уже была определена.
+        m.get_root().script.add_child(folium.Element(f"""
+setTimeout(function() {{
+  try {{
+    var map = {map_var};
+    if (map && map.attributionControl) {{
+      map.attributionControl.setPrefix("Цифровая кафедра. МИИГАиК");
+    }}
+  }} catch (e) {{}}
+}}, 0);
+"""))
+    except Exception:
+        pass
+
     output_path = os.path.join(config.DATA_DIR, filename)
     m.save(output_path)
     print(f"Карта сохранена в {output_path}")
@@ -247,11 +355,11 @@ def plot_feature_importance(model, feature_names, filename='feature_importance.p
         
         plt.figure(figsize=(12, 8))
         plt.title("Важность признаков (Топ-20)", fontsize=16)
-        plt.bar(range(len(indices)), importances[indices], align='center')
-        plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=45, ha='right')
-        plt.tight_layout()
-        plt.ylabel('Важность (Gini importance)')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.bar(range(len(indices)), importances[indices], align='center', color='#3498db', alpha=0.8, edgecolor='black')
+    plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=45, ha='right', fontsize=10)
+    plt.tight_layout()
+    plt.ylabel('Важность (Gini importance)', fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
         
         output_path = os.path.join(config.DATA_DIR, filename)
         plt.savefig(output_path)
@@ -366,11 +474,10 @@ def plot_models_comparison(results_dict, filename='models_comparison.png'):
     
     for i, model in enumerate(models):
         values = []
+        model_results = results_dict[model]
         for m in metrics:
-            if m == 'f1':
-                values.append(results_dict[model].get('f1', results_dict[model]['metrics'].get('f1', 0)))
-            else:
-                values.append(results_dict[model]['metrics'].get(m, 0))
+            # Метрики хранятся напрямую в словаре, не в подключе 'metrics'
+            values.append(model_results.get(m, 0))
         
         bars = ax.bar(x + i * width, values, width, label=model, color=colors[i % len(colors)], alpha=0.8)
         
@@ -540,7 +647,7 @@ def plot_cluster_pca(X, cluster_labels, filename='cluster_pca.png'):
     
     explained_var = pca.explained_variance_ratio_
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
     
     unique_clusters = np.unique(cluster_labels)
     colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
@@ -548,12 +655,12 @@ def plot_cluster_pca(X, cluster_labels, filename='cluster_pca.png'):
     for cluster, color in zip(unique_clusters, colors):
         mask = cluster_labels == cluster
         axes[0].scatter(X_pca[mask, 0], X_pca[mask, 1], c=[color],
-                       label=f'Кластер {cluster}', alpha=0.6, s=30)
+                       label=f'Кластер {cluster}', alpha=0.6, s=40, edgecolor='white', linewidth=0.5)
     
-    axes[0].set_xlabel(f'PC1 ({explained_var[0]:.1%} дисперсии)')
-    axes[0].set_ylabel(f'PC2 ({explained_var[1]:.1%} дисперсии)')
-    axes[0].set_title('Визуализация кластеров (PCA)', fontsize=12, fontweight='bold')
-    axes[0].legend(loc='best')
+    axes[0].set_xlabel(f'PC1 ({explained_var[0]:.1%} дисперсии)', fontsize=12)
+    axes[0].set_ylabel(f'PC2 ({explained_var[1]:.1%} дисперсии)', fontsize=12)
+    axes[0].set_title('Визуализация кластеров в пространстве PCA', fontsize=14, fontweight='bold')
+    axes[0].legend(loc='best', fontsize=10)
     axes[0].grid(True, alpha=0.3)
     
     pca_full = PCA(n_components=min(20, X_scaled.shape[1]))
@@ -561,15 +668,15 @@ def plot_cluster_pca(X, cluster_labels, filename='cluster_pca.png'):
     
     axes[1].bar(range(1, len(pca_full.explained_variance_ratio_) + 1), 
                 pca_full.explained_variance_ratio_, color='#1a9850', alpha=0.7,
-                label='Индивидуальная')
+                label='Индивидуальная', edgecolor='black')
     axes[1].plot(range(1, len(pca_full.explained_variance_ratio_) + 1),
                  np.cumsum(pca_full.explained_variance_ratio_), 'o-', color='#d73027',
-                 label='Кумулятивная')
+                 label='Кумулятивная', markersize=6)
     axes[1].axhline(y=0.9, color='gray', linestyle='--', alpha=0.7, label='90% порог')
-    axes[1].set_xlabel('Номер компоненты')
-    axes[1].set_ylabel('Объясненная дисперсия')
-    axes[1].set_title('Объясненная дисперсия (PCA)', fontsize=12, fontweight='bold')
-    axes[1].legend(loc='center right')
+    axes[1].set_xlabel('Номер компоненты', fontsize=12)
+    axes[1].set_ylabel('Объясненная дисперсия', fontsize=12)
+    axes[1].set_title('График объясненной дисперсии (Scree Plot)', fontsize=14, fontweight='bold')
+    axes[1].legend(loc='center right', fontsize=10)
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -614,11 +721,11 @@ def plot_cluster_profiles(df, cluster_col='cluster', features=None, filename='cl
         ax.bar(x + i * width, row.values, width, label=f'Кластер {cluster}', 
                color=colors[i], alpha=0.8)
     
-    ax.set_ylabel('Нормализованное значение')
-    ax.set_title('Профили кластеров', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Нормализованное значение', fontsize=12)
+    ax.set_title('Профили кластеров (сравнение средних)', fontsize=14, fontweight='bold', pad=20)
     ax.set_xticks(x + width * (n_clusters - 1) / 2)
-    ax.set_xticklabels([f.replace('_', '\n') for f in features], rotation=45, ha='right', fontsize=8)
-    ax.legend(loc='upper right')
+    ax.set_xticklabels([f.replace('_', '\n') for f in features], rotation=0, ha='center', fontsize=10)
+    ax.legend(loc='upper right', fontsize=10)
     ax.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
@@ -634,36 +741,36 @@ def plot_business_metrics(results, model_name='Best Model', filename='business_m
     """
     Визуализация бизнес-метрик: Precision@K, Lift, Bootstrap CI.
     """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
     # 1. Precision@K
     if 'precision_at_k' in results:
         p_at_k = results['precision_at_k']
-        ks = [int(k.split('@')[1]) for k in p_at_k.keys()]
+        labels = [k for k in p_at_k.keys()]
         vals = list(p_at_k.values())
         
-        axes[0].bar(ks, vals, color='#2ecc71', alpha=0.8, edgecolor='black')
-        axes[0].set_xlabel('K')
+        axes[0].bar(labels, vals, color='#2ecc71', alpha=0.8, edgecolor='black', width=0.6)
         axes[0].set_ylabel('Precision@K')
-        axes[0].set_title('Precision@K\n(доля успешных в топ-K)', fontsize=11, fontweight='bold')
-        axes[0].set_ylim(0, 1)
+        axes[0].set_title('Precision@K\n(доля успешных в топ-K)', fontsize=12, fontweight='bold', pad=15)
+        axes[0].set_ylim(0, 1.1)
         for i, v in enumerate(vals):
-            axes[0].text(ks[i], v + 0.02, f'{v:.2f}', ha='center', fontsize=10)
+            axes[0].text(i, v + 0.02, f'{v:.2f}', ha='center', fontsize=11, fontweight='bold')
     
     # 2. Lift@K
     if 'lift' in results:
         lift = results['lift']
-        ks = [int(k.split('@')[1]) for k in lift.keys()]
+        labels = [k for k in lift.keys()]
         vals = list(lift.values())
         
-        axes[1].bar(ks, vals, color='#3498db', alpha=0.8, edgecolor='black')
+        axes[1].bar(labels, vals, color='#3498db', alpha=0.8, edgecolor='black', width=0.6)
         axes[1].axhline(y=1, color='red', linestyle='--', label='Baseline (random)')
-        axes[1].set_xlabel('K')
         axes[1].set_ylabel('Lift')
-        axes[1].set_title('Lift@K\n(во сколько раз лучше случайного)', fontsize=11, fontweight='bold')
-        axes[1].legend()
+        axes[1].set_title('Lift@K\n(во сколько раз лучше случайного)', fontsize=12, fontweight='bold', pad=15)
+        axes[1].legend(fontsize=10)
+        max_val = max(vals) if vals else 1
+        axes[1].set_ylim(0, max_val * 1.3)
         for i, v in enumerate(vals):
-            axes[1].text(ks[i], v + 0.1, f'{v:.1f}x', ha='center', fontsize=10)
+            axes[1].text(i, v + (max_val * 0.05), f'{v:.1f}x', ha='center', fontsize=11, fontweight='bold')
     
     # 3. Bootstrap CI
     if 'bootstrap_ci' in results:
@@ -683,11 +790,11 @@ def plot_business_metrics(results, model_name='Best Model', filename='business_m
         axes[2].set_xticks(x)
         axes[2].set_xticklabels(metric_names)
         axes[2].set_ylabel('Значение метрики')
-        axes[2].set_title('Bootstrap 95% CI\n(доверительные интервалы)', fontsize=11, fontweight='bold')
-        axes[2].set_ylim(0, 1)
+        axes[2].set_title('Bootstrap 95% CI\n(доверительные интервалы)', fontsize=12, fontweight='bold', pad=15)
+        axes[2].set_ylim(0, 1.1)
     
-    plt.suptitle(f'Бизнес-метрики модели: {model_name}', fontsize=14, fontweight='bold', y=1.02)
-    plt.tight_layout()
+    plt.suptitle(f'Бизнес-метрики модели: {model_name}', fontsize=16, fontweight='bold')
+    plt.subplots_adjust(wspace=0.3, top=0.85, bottom=0.15)
     
     output_path = os.path.join(config.DATA_DIR, filename)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

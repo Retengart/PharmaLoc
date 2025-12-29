@@ -44,6 +44,9 @@ def parse_args():
     
     parser.add_argument('--skip-data', action='store_true',
                        help='Пропустить загрузку данных OSM (использовать кэш)')
+
+    parser.add_argument('--recompute-features', action='store_true',
+                       help='Пересчитать признаки даже при наличии кэша h3_grid_with_features (OSM данные берутся из сохранённых GeoJSON)')
     
     parser.add_argument('--no-leakage', action='store_true',
                        help='Исключить признаки с утечкой данных (pharmacy_*) для честной оценки')
@@ -68,19 +71,38 @@ def check_existing_model():
 
 def load_cached_data():
     """Загружает кэшированные данные"""
+    h3_grid = None
+    osm_data = None
+    roi_params = None
+
     try:
-        h3_grid = gpd.read_file(config.FILES['h3_grid_features'])
         osm_data = data_loader.load_osm_data()
-        
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить OSM данные из кэша: {e}")
+        osm_data = None
+
+    try:
         with open(config.FILES['roi_params'], 'r') as f:
             import json
             roi_params = json.load(f)
-        
-        print("✓ Данные загружены из кэша")
-        return h3_grid, osm_data, roi_params
     except Exception as e:
-        print(f"⚠️ Не удалось загрузить кэш: {e}")
-        return None, None, None
+        print(f"⚠️ Не удалось загрузить roi_params из кэша: {e}")
+        roi_params = None
+
+    try:
+        h3_grid = gpd.read_file(config.FILES['h3_grid_features'])
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить h3_grid_with_features из кэша: {e}")
+        h3_grid = None
+
+    if osm_data is not None and roi_params is not None:
+        print("✓ OSM данные и параметры ROI загружены из кэша")
+        if h3_grid is not None:
+            print("✓ Признаки H3 загружены из кэша")
+        return h3_grid, osm_data, roi_params
+
+    print("⚠️ Кэш неполный, потребуется загрузка данных заново")
+    return None, None, None
 
 
 def run_validation_mode():
@@ -98,7 +120,7 @@ def run_validation_mode():
         print("   python3 -m app_pharmacy.main --train --no-leakage")
         return
     
-    best_model, saved_features, exclude_leakage = modeling.load_model(model_path)
+    best_model, saved_features, exclude_leakage, _ = modeling.load_model(model_path)
     print(f"✓ Модель загружена из {model_path}")
     if exclude_leakage:
         print("   (обучена без признаков с утечкой)")
@@ -115,46 +137,129 @@ def run_validation_mode():
     config.BACKUP_COORDS = config.VALIDATION_COORDS
     
     try:
-        # Получаем данные для валидационного региона
-        val_roi_params = data_loader.get_region_bounds()
-        val_osm_data = data_loader.load_osm_data(use_cache=False)  # Без кэша для нового региона
+        # Получаем геометрию валидационного региона
+        val_roi_geometry, val_roi_params, _ = data_loader.get_roi_geometry(config.VALIDATION_PLACE_NAME)
+        
+        if val_roi_geometry is None:
+            print("❌ Не удалось получить границы валидационного региона")
+            return
+        
+        # Загружаем OSM данные для валидационного региона
+        print("📥 Загрузка OSM данных для валидационного региона...")
+        val_osm_data = {}
+        for name, tags in config.OSM_TAGS.items():
+            val_osm_data[name] = data_loader.safe_get_osm_data(tags, val_roi_geometry, name)
+        
+        # Загружаем дорожную сеть
+        print("📥 Загрузка дорожной сети...")
+        val_osm_data['roads'] = data_loader.get_road_network(val_roi_geometry)
         
         # Создаём H3 сетку
-        from .features import create_h3_grid, generate_all_features
-        val_h3_grid = create_h3_grid(val_roi_params)
+        val_h3_grid = features.create_h3_grid(val_roi_params)
         print(f"✓ Создана H3 сетка: {len(val_h3_grid)} ячеек")
         
-        # Генерируем признаки
-        val_h3_grid = generate_all_features(val_h3_grid, val_osm_data)
-        print("✓ Сгенерированы признаки")
+        # Генерируем признаки (ВАЖНО: порядок как в основном pipeline)
+        print("📊 Генерация признаков...")
+        
+        # Сначала целевая переменная
+        print("📊 Создание целевой переменной (has_pharmacy)...")
+        val_h3_grid = parallel_processing.parallel_target_variable(val_h3_grid, val_osm_data.get('pharmacies'))
+        
+        # Затем остальные признаки
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('transport_subway'), 'transport_subway')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('transport_ground'), 'transport_ground')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('residential'), 'residential')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('medical'), 'medical')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('offices'), 'office')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('retail'), 'retail')
+        # Признаки pharmacy_* создаются после целевой переменной
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('pharmacies'), 'pharmacy')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('parking'), 'parking')
+        val_h3_grid = parallel_processing.scipy_kdtree_features(val_h3_grid, val_osm_data.get('pedestrian'), 'pedestrian')
+        
+        val_h3_grid = parallel_processing.parallel_area_features(val_h3_grid, val_osm_data.get('residential'), 'residential')
+        val_h3_grid = parallel_processing.parallel_area_features(val_h3_grid, val_osm_data.get('offices'), 'office')
+        val_h3_grid = parallel_processing.parallel_road_features(val_h3_grid, val_osm_data.get('roads'))
+        
+        val_h3_grid = features.calculate_custom_features(val_h3_grid)
+        val_h3_grid = features.calculate_competitor_features(val_h3_grid, val_osm_data.get('pharmacies'))
+        
+        # Обогащение данными из data.mos.ru для ЗАО
+        print("📥 Обогащение данными из data.mos.ru...")
+        try:
+            val_h3_grid = data_mos.enrich_h3_grid_with_mos_data(val_h3_grid, val_osm_data)
+        except Exception as e:
+            print(f"  ⚠️ Ошибка интеграции data.mos.ru: {e}")
+        
+        print("✓ Признаки сгенерированы")
         print(f"   Ячеек с аптеками: {val_h3_grid['has_pharmacy'].sum()}")
         
         # Подготавливаем данные
         feature_cols = [c for c in val_h3_grid.columns if c not in [
-            'h3_index', 'geometry', 'center_lat', 'center_lon', 
+            'h3_cell', 'h3_index', 'geometry', 'center_lat', 'center_lon', 
             'has_pharmacy', 'prediction_score', 'potential_score', 'cluster'
         ]]
         
         X_val, y_val = modeling.prepare_data(val_h3_grid, feature_cols, exclude_leakage=exclude_leakage)
         
-        # Добавляем кластерные признаки (используем те же k что и при обучении)
-        X_val_ext, _, _, _ = modeling.add_cluster_features(X_val, n_clusters=2)
+        # ИСПРАВЛЕНО: Загружаем сохраненные модели кластеризации из файла модели
+        # ВАЖНО: Используем те же модели кластеризации, что были при обучении
+        print("   Добавление кластерных признаков для валидации...")
         
-        # Проверяем совпадение признаков
+        # Пытаемся загрузить модели кластеризации из сохраненной модели
+        cluster_models = None
+        try:
+            import joblib
+            model_data = joblib.load(model_path)
+            # Модели кластеризации могут быть сохранены в разных форматах
+            if isinstance(model_data, dict):
+                if '_cluster_models' in model_data:
+                    cluster_models = model_data['_cluster_models']
+                elif 'cluster_models' in model_data:
+                    cluster_models = model_data['cluster_models']
+        except Exception as e:
+            print(f"   ⚠️ Не удалось загрузить модели кластеризации: {e}")
+        
+        if cluster_models and 'kmeans' in cluster_models and 'scaler' in cluster_models:
+            # Используем сохраненные модели
+            print("   ✓ Использование сохраненных моделей кластеризации")
+            X_val_ext, _, _, _ = modeling.add_cluster_features(
+                X_val,
+                n_clusters=cluster_models.get('n_clusters', 2),
+                kmeans_model=cluster_models['kmeans'],
+                scaler_model=cluster_models['scaler']
+            )
+        else:
+            # Fallback: создаем новые модели (не идеально, но работает)
+            print("   ⚠️ Модели кластеризации не найдены, создаются новые (может снизить качество)")
+            X_val_ext, _, _, _ = modeling.add_cluster_features(X_val, n_clusters=2)
+        
+        # ИСПРАВЛЕНО: Проверяем совпадение признаков и сохраняем порядок
         if saved_features:
             missing = set(saved_features) - set(X_val_ext.columns)
             extra = set(X_val_ext.columns) - set(saved_features)
+            
             if missing:
                 print(f"⚠️ Отсутствуют признаки: {missing}")
-                # Добавляем недостающие с нулями
-                for col in missing:
-                    X_val_ext[col] = 0
-            if extra:
-                # Удаляем лишние
-                X_val_ext = X_val_ext[[c for c in X_val_ext.columns if c in saved_features]]
+                # Добавляем недостающие с нулями (ВАЖНО: в правильном порядке)
+                for col in saved_features:
+                    if col not in X_val_ext.columns:
+                        X_val_ext[col] = 0
             
-            # Приводим к порядку как при обучении
-            X_val_ext = X_val_ext[saved_features]
+            if extra:
+                print(f"⚠️ Лишние признаки (будут удалены): {extra}")
+            
+            # ВАЛИДАЦИЯ: Проверяем, что все необходимые признаки присутствуют
+            missing_final = set(saved_features) - set(X_val_ext.columns)
+            if missing_final:
+                raise ValueError(f"Критическая ошибка: отсутствуют признаки модели: {missing_final}")
+            
+            # Приводим к порядку как при обучении (ВАЖНО для некоторых моделей)
+            X_val_ext = X_val_ext[[c for c in saved_features if c in X_val_ext.columns]]
+            
+            # ВАЛИДАЦИЯ: Финальная проверка количества признаков
+            if len(X_val_ext.columns) != len(saved_features):
+                print(f"⚠️ Количество признаков не совпадает: {len(X_val_ext.columns)} vs {len(saved_features)}")
         
         # Валидация
         metrics, y_pred, y_proba = modeling.validate_on_region(
@@ -220,6 +325,7 @@ def main():
         train_new_model = args.train
     
     use_cached_data = args.skip_data
+    force_recompute_features = bool(getattr(args, 'recompute_features', False))
     
     print("\n" + "="*80)
     print("📥 ЭТАП 1: СБОР ГЕОПРОСТРАНСТВЕННЫХ ДАННЫХ")
@@ -227,8 +333,10 @@ def main():
     
     if use_cached_data:
         h3_grid, osm_data, roi_params = load_cached_data()
-        if h3_grid is None:
-            print("Кэш не найден, загружаем данные...")
+        # Кэш считается пригодным, если есть OSM GeoJSON + roi_params.
+        # H3-признаки могут отсутствовать, если нужно пересчитать features.
+        if osm_data is None or roi_params is None:
+            print("Кэш не найден или неполный, загружаем данные...")
             use_cached_data = False
     
     if not use_cached_data:
@@ -249,7 +357,15 @@ def main():
     print("🔧 ЭТАП 2: ГЕНЕРАЦИЯ ПРИЗНАКОВ (Feature Engineering)")
     print("="*80)
     
-    need_features = h3_grid is None or 'has_pharmacy' not in h3_grid.columns
+    # Инициализируем exclude_leakage раньше, чтобы использовать в предупреждениях
+    exclude_leakage = args.no_leakage if hasattr(args, 'no_leakage') else False
+    
+    need_features = force_recompute_features or h3_grid is None or 'has_pharmacy' not in h3_grid.columns
+
+    if force_recompute_features:
+        print("🔁 Принудительный пересчёт признаков включен (--recompute-features)")
+        # Не используем закэшированный GeoJSON с признаками — пересчитаем заново
+        h3_grid = None
     
     if need_features:
         if h3_grid is None:
@@ -261,6 +377,11 @@ def main():
             
         print(f"✓ Сетка H3 создана: {len(h3_grid)} ячеек (разрешение {config.H3_RESOLUTION})")
         
+        # КРИТИЧНО: Сначала создаем целевую переменную, чтобы избежать data leakage
+        # Целевая переменная использует данные аптек напрямую
+        print("\n📊 Создание целевой переменной (has_pharmacy)...")
+        h3_grid = parallel_processing.parallel_target_variable(h3_grid, osm_data.get('pharmacies'))
+        
         print("\n📊 Расчет признаков расстояния (SciPy cKDTree)...")
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('transport_subway'), 'transport_subway')
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('transport_ground'), 'transport_ground')
@@ -268,6 +389,9 @@ def main():
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('medical'), 'medical')
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('offices'), 'office')
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('retail'), 'retail')
+        # ВАЖНО: Признаки pharmacy_* создаются ПОСЛЕ целевой переменной
+        # Они будут исключены при обучении через флаг --no-leakage
+        # или автоматически через LEAKAGE_FEATURES в config.py
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('pharmacies'), 'pharmacy')
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('parking'), 'parking')
         h3_grid = parallel_processing.scipy_kdtree_features(h3_grid, osm_data.get('pedestrian'), 'pedestrian')
@@ -280,9 +404,8 @@ def main():
         h3_grid = features.calculate_custom_features(h3_grid)
         
         print("\n📊 Анализ конкурентной среды...")
+        # Признаки competitor_chain_* безопасны, так как используют только сетевые аптеки
         h3_grid = features.calculate_competitor_features(h3_grid, osm_data.get('pharmacies'))
-        
-        h3_grid = parallel_processing.parallel_target_variable(h3_grid, osm_data.get('pharmacies'))
         
         # Обогащение данными из data.mos.ru (опционально)
         if args.enrich or config.DATA_MOS_CONFIG.get('enabled', False):
@@ -295,6 +418,14 @@ def main():
         print("\n✓ Признаки рассчитаны")
         print(f"  - Всего признаков: {len([c for c in h3_grid.columns if c not in ['h3_cell', 'geometry', 'center_lat', 'center_lon', 'has_pharmacy']])}")
         print(f"  - Ячеек с аптеками: {h3_grid['has_pharmacy'].sum()} ({h3_grid['has_pharmacy'].mean()*100:.1f}%)")
+        
+        # Предупреждение о data leakage
+        leakage_features_present = [col for col in h3_grid.columns if any(leak in col for leak in ['pharmacy_nearest', 'pharmacy_count', 'pharmacy_density'])]
+        if leakage_features_present and not exclude_leakage:
+            print(f"\n⚠️ ВНИМАНИЕ: Обнаружены признаки с потенциальной утечкой данных ({len(leakage_features_present)}):")
+            print("   Эти признаки напрямую связаны с целевой переменной и могут завышать метрики.")
+            print("   Рекомендуется использовать флаг --no-leakage для честной оценки модели.")
+            print("   Пример: python3 -m app_pharmacy.main --train --no-leakage")
         
         h3_grid.to_file(config.FILES['h3_grid_features'], driver='GeoJSON')
     else:
@@ -377,7 +508,9 @@ def main():
     results = None
     feature_cols_extended = None
     
-    exclude_leakage = args.no_leakage if hasattr(args, 'no_leakage') else False
+    # exclude_leakage уже определена выше, но проверяем для безопасности
+    if 'exclude_leakage' not in locals():
+        exclude_leakage = args.no_leakage if hasattr(args, 'no_leakage') else False
     
     if h3_grid['has_pharmacy'].sum() > 5:
         if exclude_leakage:
@@ -387,13 +520,19 @@ def main():
             feature_cols_clean = [c for c in feature_cols_clean if c not in removed_corr]
             X_cluster_clean, _ = modeling.prepare_data(h3_grid, feature_cols_clean)
         else:
+            # ИСПРАВЛЕНО: Используем X_cluster_clean_corr только если она определена
+            # Если корреляционный анализ не выполнялся, используем исходные признаки
             feature_cols_clean = [c for c in feature_cols if c not in removed_corr]
-            X_cluster_clean = X_cluster_clean_corr
+            if 'X_cluster_clean_corr' in locals() and X_cluster_clean_corr is not None:
+                X_cluster_clean = X_cluster_clean_corr
+            else:
+                # Fallback: создаем заново из отфильтрованных признаков
+                X_cluster_clean, _ = modeling.prepare_data(h3_grid, feature_cols_clean)
         
-        print("\n📊 Добавление кластерных признаков...")
-        X_with_clusters, _, _, _ = modeling.add_cluster_features(X_cluster_clean, n_clusters=best_k)
+        # ВАЖНО: Кластерные признаки для ML добавляются ВНУТРИ train_models после разделения на train/test
+        # Это предотвращает переобучение. Здесь мы используем X_cluster_clean без кластерных признаков.
         
-        feature_cols_extended = list(X_with_clusters.columns)
+        feature_cols_extended = list(X_cluster_clean.columns)
         
         y = h3_grid['has_pharmacy']
         
@@ -402,7 +541,22 @@ def main():
             if exclude_leakage:
                 print("   (без признаков с утечкой — честная оценка)")
             
-            best_model, results, X_test, y_test = modeling.train_models(X_with_clusters, y, h3_grid=h3_grid)
+            # Передаем h3_grid для автоматического использования Spatial CV
+            # Кластерные признаки будут добавлены внутри train_models после разделения данных
+            # Передаем best_k для согласованности с кластеризацией для анализа
+            best_model, results, X_test, y_test = modeling.train_models(
+                X_cluster_clean, y, h3_grid=h3_grid, n_clusters=best_k
+            )
+
+            # КРИТИЧНО: модель обучается с добавленными cluster_* признаками внутри train_models,
+            # поэтому список feature_cols_extended должен соответствовать тому, что модель реально "видела" при fit.
+            model_feature_names = modeling.get_model_feature_names(best_model)
+            if model_feature_names:
+                feature_cols_extended = model_feature_names
+                # Сохраним в results для прозрачности/отладки
+                if isinstance(results, dict):
+                    results['_feature_names'] = model_feature_names
+                print(f"   ✓ Признаки модели (по обученной модели): {len(feature_cols_extended)}")
             
             best_f1 = max(r.get('f1', 0) for k, r in results.items() if not k.startswith('_'))
             if best_f1 >= 0.99 and not exclude_leakage:
@@ -420,11 +574,12 @@ def main():
                 best_model, 
                 config.FILES['model'],
                 feature_names=feature_cols_extended,
-                exclude_leakage=exclude_leakage
+                exclude_leakage=exclude_leakage,
+                results=results  # Сохраняем результаты для визуализации
             )
         else:
             print("\n📂 Загрузка существующей модели...")
-            best_model, saved_features, saved_exclude_leakage = modeling.load_model(config.FILES['model'])
+            best_model, saved_features, saved_exclude_leakage, saved_results = modeling.load_model(config.FILES['model'])
             print(f"✓ Модель загружена из {config.FILES['model']}")
             
             # Используем признаки, с которыми модель была обучена
@@ -436,6 +591,19 @@ def main():
                     feature_cols_clean = modeling.filter_leakage_features(feature_cols, exclude_leakage=True)
                     X_cluster_clean, _ = modeling.prepare_data(h3_grid, feature_cols_clean)
                 feature_cols_extended = saved_features
+
+            # ВАЖНО: даже если метаданные feature_names отсутствуют/неполные,
+            # можем восстановить ожидаемые признаки из самой модели (sklearn feature_names_in_).
+            model_feature_names = modeling.get_model_feature_names(best_model)
+            if model_feature_names:
+                if feature_cols_extended is None or len(model_feature_names) != len(feature_cols_extended):
+                    print("   ⚠️ Список признаков из файла модели не совпадает/отсутствует — используем признаки, ожидаемые моделью")
+                feature_cols_extended = model_feature_names
+            
+            # Загружаем сохранённые результаты для визуализации
+            if saved_results is not None:
+                results = saved_results
+                print("   (с результатами обучения для визуализации)")
         
         if results is not None:
             print("\n" + "="*80)
@@ -480,7 +648,53 @@ def main():
             print("\n📊 Этап 6 пропущен (модель загружена из кэша)")
         
         print("\n🔮 Генерация предсказаний для всей территории...")
-        X_all_extended, _, _, _ = modeling.add_cluster_features(X_cluster_clean, n_clusters=best_k)
+        
+        # Используем модели кластеризации из результатов обучения
+        cluster_models = None
+        if results is not None and '_cluster_models' in results:
+            cluster_models = results['_cluster_models']
+            print("   Использование обученных моделей кластеризации для предсказаний")
+        
+        if cluster_models:
+            # Применяем кластерные признаки с использованием обученных моделей
+            X_all_extended, _, _, _ = modeling.add_cluster_features(
+                X_cluster_clean, 
+                n_clusters=cluster_models['n_clusters'],
+                kmeans_model=cluster_models['kmeans'],
+                scaler_model=cluster_models['scaler']
+            )
+        else:
+            # Fallback: если модели кластеризации не найдены, используем без них
+            print("   ⚠️ Модели кластеризации не найдены, предсказания без кластерных признаков")
+            X_all_extended = X_cluster_clean.copy()
+
+        # На всякий случай ещё раз уточняем список ожидаемых признаков по модели
+        expected_features = modeling.get_model_feature_names(best_model)
+        if expected_features:
+            feature_cols_extended = expected_features
+        
+        # ИСПРАВЛЕНО: Используем только те признаки, на которых модель была обучена
+        # ВАЖНО: Сохраняем порядок признаков как при обучении модели
+        if feature_cols_extended is not None:
+            # Добавляем недостающие признаки с нулями (ВАЖНО: в правильном порядке)
+            for col in feature_cols_extended:
+                if col not in X_all_extended.columns:
+                    X_all_extended[col] = 0
+            
+            # ВАЛИДАЦИЯ: Проверяем, что все необходимые признаки присутствуют
+            missing_final = set(feature_cols_extended) - set(X_all_extended.columns)
+            if missing_final:
+                raise ValueError(f"Критическая ошибка: отсутствуют признаки модели: {missing_final}")
+            
+            # Приводим к правильному порядку (ВАЖНО для некоторых моделей)
+            # Фильтруем только существующие признаки и сохраняем порядок
+            X_all_extended = X_all_extended[[c for c in feature_cols_extended if c in X_all_extended.columns]]
+            
+            # ВАЛИДАЦИЯ: Проверяем совпадение количества признаков
+            if len(X_all_extended.columns) != len(feature_cols_extended):
+                print(f"⚠️ Количество признаков не совпадает: {len(X_all_extended.columns)} vs {len(feature_cols_extended)}")
+                print(f"   Отсутствуют: {set(feature_cols_extended) - set(X_all_extended.columns)}")
+        
         h3_grid['prediction_score'] = best_model.predict_proba(X_all_extended)[:, 1]
         
     else:
@@ -491,7 +705,9 @@ def main():
     print("💡 ЭТАП 7: АНАЛИЗ И ФОРМИРОВАНИЕ РЕКОМЕНДАЦИЙ")
     print("="*80)
     
-    h3_grid = analysis.calculate_potential(h3_grid)
+    # Используем настройку из конфига для rule-based потенциала
+    use_rule_based = config.POTENTIAL_BLEND.get('use_rule_based', True)
+    h3_grid = analysis.calculate_potential(h3_grid, use_rule_based=use_rule_based)
     
     top_cells, recommendations = analysis.get_recommendations(h3_grid, min_distance_to_competitor=300)
     

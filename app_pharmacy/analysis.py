@@ -1,15 +1,35 @@
 import pandas as pd
+import numpy as np
 import json
 import os
 from datetime import datetime
 from . import config
 
-def calculate_potential(h3_grid, weights=config.POTENTIAL_WEIGHTS):
-    """Расчет интегрального потенциала"""
+def calculate_potential(h3_grid, weights=config.POTENTIAL_WEIGHTS, use_rule_based=True):
+    """
+    Расчет интегрального потенциала.
+    
+    Args:
+        h3_grid: GeoDataFrame с признаками
+        weights: Веса для rule-based оценки
+        use_rule_based: Использовать ли rule-based оценку или только ML предсказания
+    
+    Returns:
+        GeoDataFrame с добавленным столбцом potential_score
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if h3_grid is None or h3_grid.empty:
+        raise ValueError("h3_grid не может быть пустым")
+    
+    if not isinstance(weights, dict):
+        raise TypeError("weights должен быть словарем")
     
     def normalize(series):
+        """Нормализация признака к [0, 1]"""
+        if series is None or len(series) == 0:
+            return pd.Series(0, index=h3_grid.index)
         if series.max() == series.min():
-            return 0
+            return pd.Series(0, index=h3_grid.index)
         return (series - series.min()) / (series.max() - series.min())
 
     w_med = weights.get('medical_synergy', 0)
@@ -85,12 +105,48 @@ def calculate_potential(h3_grid, weights=config.POTENTIAL_WEIGHTS):
         w_comp * val_comp
     )
     
+    # ВАЛИДАЦИЯ: Проверка на NaN в score
+    if score.isna().any():
+        print("⚠️ Обнаружены NaN в rule-based оценке, заменяем на 0")
+        score = score.fillna(0)
+    
+    # Смешивание rule-based и ML оценок
     if 'prediction_score' in h3_grid.columns:
-        rule_w = config.POTENTIAL_BLEND['rule_weight']
-        ml_w = config.POTENTIAL_BLEND['ml_weight']
-        h3_grid['potential_score'] = rule_w * score + ml_w * h3_grid['prediction_score']
+        # ВАЛИДАЦИЯ: Проверка на NaN в prediction_score
+        if h3_grid['prediction_score'].isna().any():
+            print("⚠️ Обнаружены NaN в ML предсказаниях, заменяем на медиану")
+            median_pred = h3_grid['prediction_score'].median()
+            h3_grid['prediction_score'] = h3_grid['prediction_score'].fillna(median_pred if np.isfinite(median_pred) else 0)
+        
+        if use_rule_based:
+            # Используем смешанный подход
+            rule_w = config.POTENTIAL_BLEND['rule_weight']
+            ml_w = config.POTENTIAL_BLEND['ml_weight']
+            
+            # ВАЛИДАЦИЯ: Проверка сумм весов (должна быть ~1.0)
+            total_weight = rule_w + ml_w
+            if abs(total_weight - 1.0) > 0.01:
+                print(f"⚠️ Сумма весов rule-based и ML не равна 1.0 ({total_weight:.2f}), нормализуем")
+                rule_w = rule_w / total_weight
+                ml_w = ml_w / total_weight
+            
+            h3_grid['potential_score'] = rule_w * score + ml_w * h3_grid['prediction_score']
+            h3_grid['rule_based_score'] = score  # Сохраняем для анализа
+        else:
+            # Используем только ML предсказания (более честный подход)
+            print("   ⚠️ Используется только ML предсказание (rule-based отключен)")
+            h3_grid['potential_score'] = h3_grid['prediction_score']
+            h3_grid['rule_based_score'] = score  # Сохраняем для сравнения
     else:
+        # Если ML модель не обучена, используем только rule-based
         h3_grid['potential_score'] = score
+        if not use_rule_based:
+            print("   ⚠️ ML модель не найдена, используется rule-based оценка")
+    
+    # ВАЛИДАЦИЯ: Финальная проверка на NaN в potential_score
+    if h3_grid['potential_score'].isna().any():
+        print("⚠️ Обнаружены NaN в potential_score после расчета, заменяем на 0")
+        h3_grid['potential_score'] = h3_grid['potential_score'].fillna(0)
         
     return h3_grid
 

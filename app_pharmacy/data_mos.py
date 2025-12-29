@@ -10,12 +10,21 @@
 import requests
 import pandas as pd
 import geopandas as gpd
+import numpy as np
 from shapely.geometry import Point
 import os
+import logging
 from . import config
 
-# API ключ из конфига или переменной окружения
-API_KEY = os.environ.get('DATA_MOS_API_KEY', 'f9f69a50-7835-4047-8d2f-de17160137c7')
+# Настройка логирования
+logger = logging.getLogger(__name__)
+
+# API ключ из переменной окружения (безопаснее чем хардкод)
+# Установите переменную окружения: export DATA_MOS_API_KEY="your_key_here"
+API_KEY = os.environ.get('DATA_MOS_API_KEY', config.DATA_MOS_CONFIG.get('api_key', ''))
+if not API_KEY:
+    print("⚠️ ВНИМАНИЕ: DATA_MOS_API_KEY не установлен. Функции data.mos.ru могут не работать.")
+    print("   Установите переменную окружения: export DATA_MOS_API_KEY='your_key'")
 
 # Полезные датасеты data.mos.ru
 DATASETS = {
@@ -270,25 +279,54 @@ def enrich_h3_grid_with_mos_data(h3_grid, osm_data=None):
         GeoDataFrame с дополнительными признаками
     """
     print("\n📥 Обогащение данными из data.mos.ru...")
+
+    # Подготовка: выбираем метрическую CRS (обычно UTM) и считаем координаты центров ячеек в метрах
+    from scipy.spatial import cKDTree
+
+    if getattr(h3_grid, "crs", None) is None:
+        h3_grid = h3_grid.set_crs("EPSG:4326")
+
+    try:
+        metric_crs = h3_grid.estimate_utm_crs()
+        if metric_crs is None:
+            raise ValueError("estimate_utm_crs вернул None")
+    except Exception as e:
+        # fallback (менее точно), но лучше чем падать
+        print(f"  ⚠️ Не удалось определить UTM CRS ({e}), используется EPSG:3857 (менее точно)")
+        metric_crs = "EPSG:3857"
+
+    # Используем заранее вычисленные центры (если есть) — быстрее и стабильнее чем centroid полигона
+    if {'center_lat', 'center_lon'}.issubset(h3_grid.columns):
+        h3_points = gpd.GeoSeries(
+            gpd.points_from_xy(h3_grid['center_lon'], h3_grid['center_lat']),
+            crs="EPSG:4326"
+        )
+    else:
+        h3_points = h3_grid.geometry.centroid
+        if getattr(h3_points, "crs", None) is None:
+            h3_points = gpd.GeoSeries(h3_points, crs=h3_grid.crs)
+
+    h3_points_proj = h3_points.to_crs(metric_crs)
+    h3_xy = np.column_stack((h3_points_proj.x, h3_points_proj.y))
     
     # 1. Медицинские учреждения
     try:
         medical_mos = load_medical_facilities()
         if not medical_mos.empty:
-            from scipy.spatial import cKDTree
-            
-            # Расчёт расстояний до официальных медучреждений
-            h3_coords = h3_grid[['center_lat', 'center_lon']].values
-            med_coords = medical_mos[['latitude', 'longitude']].values
-            
-            tree = cKDTree(med_coords)
-            distances, _ = tree.query(h3_coords, k=1)
-            deg_to_m = config.GEOM_CONFIG['deg_to_meters']
-            h3_grid['mos_medical_nearest_distance'] = distances * deg_to_m
-            
-            # Количество в радиусе 500м
-            counts = tree.query_ball_point(h3_coords, r=500/deg_to_m)
-            h3_grid['mos_medical_count_500m'] = [len(c) for c in counts]
+            if getattr(medical_mos, "crs", None) is None:
+                medical_mos = medical_mos.set_crs("EPSG:4326")
+
+            medical_proj = medical_mos.to_crs(metric_crs)
+            med_xy = np.column_stack((medical_proj.geometry.x, medical_proj.geometry.y))
+
+            if len(med_xy) > 0:
+                tree = cKDTree(med_xy)
+                distances_m, _ = tree.query(h3_xy, k=1)
+                h3_grid['mos_medical_nearest_distance'] = distances_m
+
+                # Количество в радиусе 500м (реальные метры)
+                counts = tree.query_ball_point(h3_xy, r=500)
+                h3_grid['mos_medical_count_500m'] = [len(c) for c in counts]
     except Exception as e:
         print(f"  ⚠️ Ошибка загрузки медучреждений: {e}")
     
@@ -296,11 +334,16 @@ def enrich_h3_grid_with_mos_data(h3_grid, osm_data=None):
     try:
         tpu = load_transport_hubs()
         if not tpu.empty:
-            tpu_coords = tpu[['latitude', 'longitude']].values
-            tree = cKDTree(tpu_coords)
-            distances, _ = tree.query(h3_coords, k=1)
-            deg_to_m = config.GEOM_CONFIG['deg_to_meters']
-            h3_grid['mos_tpu_nearest_distance'] = distances * deg_to_m
+            if getattr(tpu, "crs", None) is None:
+                tpu = tpu.set_crs("EPSG:4326")
+
+            tpu_proj = tpu.to_crs(metric_crs)
+            tpu_xy = np.column_stack((tpu_proj.geometry.x, tpu_proj.geometry.y))
+
+            if len(tpu_xy) > 0:
+                tree = cKDTree(tpu_xy)
+                distances_m, _ = tree.query(h3_xy, k=1)
+                h3_grid['mos_tpu_nearest_distance'] = distances_m
     except Exception as e:
         print(f"  ⚠️ Ошибка загрузки ТПУ: {e}")
     
@@ -308,12 +351,33 @@ def enrich_h3_grid_with_mos_data(h3_grid, osm_data=None):
     try:
         pop_data = load_population_by_district()
         if not pop_data.empty:
-            # Определяем округ для каждой ячейки (упрощённо по координатам)
-            # В реальности нужно использовать границы округов
-            h3_grid['mos_population_available'] = True
-            print("  ✓ Демографические данные доступны")
+            # УЛУЧШЕНО: Используем демографические данные эффективно
+            # Определяем округ для каждой ячейки по координатам центра
+            # В реальности нужно использовать границы округов из GeoJSON
+            
+            # Пока используем упрощенный подход: присваиваем средние значения по округу
+            # В будущем можно улучшить через spatial join с границами округов
+            
+            # Вычисляем среднюю плотность населения по всем округам
+            if 'population_total' in pop_data.columns:
+                avg_population = pop_data['population_total'].mean()
+                h3_grid['mos_population_density_proxy'] = avg_population / 1000  # Упрощенная метрика
+                print(f"  ✓ Демографические данные: средняя плотность населения {avg_population/1000:.1f} тыс. чел.")
+            
+            # Добавляем информацию о доле пожилого населения (важно для аптек!)
+            if 'population_working' in pop_data.columns and 'population_young' in pop_data.columns:
+                total_pop = pop_data['population_working'].sum() + pop_data['population_young'].sum()
+                if total_pop > 0:
+                    # Примерная доля пожилых (65+) - важный фактор для аптек
+                    # Используем как прокси-метрику
+                    h3_grid['mos_elderly_population_factor'] = 0.15  # Примерная доля для Москвы
+                    print("  ✓ Добавлен фактор пожилого населения (важно для аптек)")
+            
+            h3_grid['mos_population_data_available'] = True
     except Exception as e:
         print(f"  ⚠️ Ошибка загрузки демографии: {e}")
+        import traceback
+        print(f"  Детали: {traceback.format_exc()}")
     
     # 4. Экономические данные (общие для города)
     try:

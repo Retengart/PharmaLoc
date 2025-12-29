@@ -11,12 +11,40 @@ from . import config
 
 
 def create_h3_grid(roi_params, resolution=config.H3_RESOLUTION):
-    """Создает гексагональную сетку H3 для области"""
+    """
+    Создает гексагональную сетку H3 для области.
+    
+    Args:
+        roi_params: Словарь с параметрами области (north, south, east, west)
+        resolution: Разрешение H3 сетки (по умолчанию из конфига)
+    
+    Returns:
+        GeoDataFrame с H3 ячейками
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if roi_params is None:
+        raise ValueError("roi_params не может быть None")
+    
+    required_keys = ['north', 'south', 'east', 'west']
+    missing_keys = [key for key in required_keys if key not in roi_params]
+    if missing_keys:
+        raise ValueError(f"roi_params должен содержать ключи: {missing_keys}")
+    
+    # ВАЛИДАЦИЯ координат
+    north, south = roi_params['north'], roi_params['south']
+    east, west = roi_params['east'], roi_params['west']
+    
+    if not (-90 <= south < north <= 90):
+        raise ValueError(f"Невалидные широты: south={south}, north={north}")
+    
+    if not (-180 <= west < east <= 180):
+        raise ValueError(f"Невалидные долготы: west={west}, east={east}")
+    
+    if resolution < 0 or resolution > 15:
+        raise ValueError(f"Разрешение H3 должно быть от 0 до 15, получено: {resolution}")
+    
     try:
         from h3 import LatLngPoly
-        
-        north, south = roi_params['north'], roi_params['south']
-        east, west = roi_params['east'], roi_params['west']
         
         bbox_coords = [
             (south, west), (south, east), (north, east), (north, west), (south, west)
@@ -56,11 +84,18 @@ def calculate_distance_based_features(h3_grid, poi_data, feature_name, radii=con
         h3_grid[f'{feature_name}_nearest_distance'] = float('inf')
         return h3_grid
 
-    if 'Point' not in poi_data.geometry.geom_type.values:
-        poi_points = poi_data.copy()
-        poi_points.geometry = poi_points.geometry.centroid
-    else:
-        poi_points = poi_data[poi_data.geometry.geom_type == 'Point'].copy()
+    # ВАЖНО: Не отбрасываем Polygon/LineString при смешанных типах геометрии.
+    # Всегда приводим к точкам через centroid (для Point centroid == Point).
+    poi_points = poi_data.copy()
+    poi_points = poi_points[~poi_points.geometry.isna() & ~poi_points.geometry.is_empty].copy()
+    poi_points.geometry = poi_points.geometry.centroid
+
+    if poi_points.empty:
+        for radius in radii:
+            h3_grid[f'{feature_name}_count_{radius}m'] = 0
+            h3_grid[f'{feature_name}_density_{radius}m'] = 0
+        h3_grid[f'{feature_name}_nearest_distance'] = float('inf')
+        return h3_grid
 
     for idx, cell in h3_grid.iterrows():
         distances = []
@@ -93,19 +128,38 @@ def calculate_area_based_features(h3_grid, area_data, feature_name):
         return h3_grid
 
     polygons = area_data[area_data.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
-    cell_area_km2 = h3.average_hexagon_area(config.H3_RESOLUTION, 'km^2')
-    deg2_to_km2 = config.GEOM_CONFIG['deg2_to_km2']
+    if polygons.empty:
+        h3_grid[f'{feature_name}_coverage'] = 0
+        return h3_grid
+
+    # Корректный расчёт площадей: работаем в метрической CRS (обычно UTM)
+    if h3_grid.crs is None:
+        h3_grid = h3_grid.set_crs("EPSG:4326")
+    if polygons.crs is None:
+        polygons = polygons.set_crs("EPSG:4326")
+    try:
+        metric_crs = h3_grid.estimate_utm_crs()
+        if metric_crs is None:
+            raise ValueError("estimate_utm_crs вернул None")
+    except Exception:
+        metric_crs = "EPSG:3857"  # fallback (менее точно)
+
+    grid_proj = h3_grid.to_crs(metric_crs)
+    poly_proj = polygons.to_crs(metric_crs)
 
     for idx, cell in h3_grid.iterrows():
-        total_intersection = 0
-        for _, area in polygons.iterrows():
+        # Берём геометрию ячейки в метрах
+        cell_geom = grid_proj.loc[idx].geometry
+        cell_area_m2 = cell_geom.area
+        total_intersection_m2 = 0.0
+
+        for _, area in poly_proj.iterrows():
             if area.geometry and not area.geometry.is_empty:
-                if cell.geometry.intersects(area.geometry):
-                    intersection = cell.geometry.intersection(area.geometry)
-                    area_deg2 = intersection.area
-                    total_intersection += area_deg2 * deg2_to_km2
-        
-        coverage = min(total_intersection / cell_area_km2, 1.0) if cell_area_km2 > 0 else 0
+                if cell_geom.intersects(area.geometry):
+                    intersection = cell_geom.intersection(area.geometry)
+                    total_intersection_m2 += intersection.area
+
+        coverage = min(total_intersection_m2 / cell_area_m2, 1.0) if cell_area_m2 > 0 else 0.0
         h3_grid.loc[idx, f'{feature_name}_coverage'] = coverage
         
     return h3_grid
@@ -116,18 +170,34 @@ def calculate_road_features(h3_grid, roads_data):
     if roads_data.empty:
         h3_grid['road_density'] = 0
         return h3_grid
-        
-    cell_area_km2 = h3.average_hexagon_area(config.H3_RESOLUTION, 'km^2')
-    deg_to_km = config.GEOM_CONFIG['deg_to_km']
+
+    # Корректный расчёт длин: работаем в метрической CRS (обычно UTM)
+    if h3_grid.crs is None:
+        h3_grid = h3_grid.set_crs("EPSG:4326")
+    if roads_data.crs is None:
+        roads_data = roads_data.set_crs("EPSG:4326")
+    try:
+        metric_crs = h3_grid.estimate_utm_crs()
+        if metric_crs is None:
+            raise ValueError("estimate_utm_crs вернул None")
+    except Exception:
+        metric_crs = "EPSG:3857"  # fallback (менее точно)
+
+    grid_proj = h3_grid.to_crs(metric_crs)
+    roads_proj = roads_data.to_crs(metric_crs)
     
     for idx, cell in h3_grid.iterrows():
-        length_km = 0
-        for _, road in roads_data.iterrows():
-            if road.geometry and cell.geometry.intersects(road.geometry):
-                intersection = cell.geometry.intersection(road.geometry)
-                length_km += intersection.length * deg_to_km
-        
-        h3_grid.loc[idx, 'road_density'] = length_km / cell_area_km2 if cell_area_km2 > 0 else 0
+        cell_geom = grid_proj.loc[idx].geometry
+        cell_area_m2 = cell_geom.area
+        length_m = 0.0
+
+        for _, road in roads_proj.iterrows():
+            if road.geometry and cell_geom.intersects(road.geometry):
+                intersection = cell_geom.intersection(road.geometry)
+                length_m += intersection.length
+
+        # км/км² = (м / 1000) / (м² / 1e6) = м * 1000 / м²
+        h3_grid.loc[idx, 'road_density'] = (length_m * 1000.0 / cell_area_m2) if cell_area_m2 > 0 else 0.0
         
     return h3_grid
 
@@ -161,7 +231,19 @@ def calculate_medical_synergy(distance, decay_type='linear'):
 
 
 def calculate_custom_features(h3_grid):
-    """Дополнительные признаки"""
+    """
+    Дополнительные признаки: многофункциональность и медицинская синергия.
+    
+    Args:
+        h3_grid: GeoDataFrame с H3 ячейками и признаками
+    
+    Returns:
+        GeoDataFrame с добавленными кастомными признаками
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if h3_grid is None or h3_grid.empty:
+        raise ValueError("h3_grid не может быть пустым")
+    
     features = ['transport_subway_count_500m', 'transport_ground_count_500m', 
                 'residential_count_500m', 'medical_count_500m', 
                 'office_count_500m', 'retail_count_500m']
@@ -176,11 +258,17 @@ def calculate_custom_features(h3_grid):
     if bool_cols:
         h3_grid['multifunctionality_index'] = h3_grid[bool_cols].sum(axis=1)
         h3_grid.drop(columns=bool_cols, inplace=True)
-        
+    
     # Медицинская синергия с настраиваемым decay
     if 'medical_nearest_distance' in h3_grid.columns:
         decay_type = config.FEATURE_CONFIG.get('medical_synergy_decay', 'linear')
-        h3_grid['medical_synergy'] = h3_grid['medical_nearest_distance'].apply(
+        # ВАЛИДАЦИЯ: Обработка NaN и inf перед применением функции
+        medical_dist = h3_grid['medical_nearest_distance'].fillna(
+            config.FEATURE_CONFIG['default_distance_fillna']
+        )
+        medical_dist = medical_dist.replace([np.inf, -np.inf], 
+                                           config.FEATURE_CONFIG['default_distance_fillna'])
+        h3_grid['medical_synergy'] = medical_dist.apply(
             lambda d: calculate_medical_synergy(d, decay_type)
         )
     
@@ -188,9 +276,29 @@ def calculate_custom_features(h3_grid):
 
 
 def calculate_competitor_features(h3_grid, pharmacies_data):
-    """Анализ типов конкурентов (сетевые vs одиночные)"""
-    if pharmacies_data.empty:
+    """
+    Анализ типов конкурентов (сетевые vs одиночные).
+    
+    Args:
+        h3_grid: GeoDataFrame с H3 ячейками
+        pharmacies_data: GeoDataFrame с данными об аптеках
+    
+    Returns:
+        GeoDataFrame с добавленными признаками конкурентов
+    """
+    # ВАЛИДАЦИЯ: Унифицированная обработка пустых данных
+    if pharmacies_data is None or pharmacies_data.empty:
         h3_grid['competitor_chain_count_500m'] = 0
+        h3_grid['competitor_chain_density_500m'] = 0.0
+        h3_grid['competitor_chain_nearest_distance'] = config.FEATURE_CONFIG['default_distance_fillna']
+        return h3_grid
+    
+    # ВАЛИДАЦИЯ: Проверка наличия колонки 'name'
+    if 'name' not in pharmacies_data.columns:
+        print("⚠️ pharmacies_data не содержит колонку 'name', создаем пустые признаки конкурентов")
+        h3_grid['competitor_chain_count_500m'] = 0
+        h3_grid['competitor_chain_density_500m'] = 0.0
+        h3_grid['competitor_chain_nearest_distance'] = config.FEATURE_CONFIG['default_distance_fillna']
         return h3_grid
     
     # Используем список сетей из конфигурации
@@ -202,16 +310,42 @@ def calculate_competitor_features(h3_grid, pharmacies_data):
     )
     
     chain_pharmacies = pharmacies_data[pharmacies_data['is_chain']]
-    
-    h3_grid = calculate_distance_based_features(h3_grid, chain_pharmacies, 'competitor_chain', radii=[500])
+
+    # Используем быстрый и метрически корректный расчёт через KDTree (как и для остальных POI)
+    try:
+        from . import parallel_processing
+        h3_grid = parallel_processing.scipy_kdtree_features(
+            h3_grid, chain_pharmacies, 'competitor_chain', radii=[500]
+        )
+    except Exception:
+        # Fallback на медленный расчёт (geodesic) если параллельный модуль недоступен
+        h3_grid = calculate_distance_based_features(h3_grid, chain_pharmacies, 'competitor_chain', radii=[500])
     
     return h3_grid
 
 
 def add_target_variable(h3_grid, pharmacies_data):
-    """Целевая переменная: наличие аптеки"""
+    """
+    Целевая переменная: наличие аптеки.
+    
+    ВАЖНО: Эта функция используется только в features.py как fallback.
+    Основная реализация находится в parallel_processing.py для оптимизации.
+    
+    Args:
+        h3_grid: GeoDataFrame с H3 ячейками
+        pharmacies_data: GeoDataFrame с данными об аптеках
+    
+    Returns:
+        GeoDataFrame с добавленной колонкой has_pharmacy
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if h3_grid is None or h3_grid.empty:
+        raise ValueError("h3_grid не может быть пустым")
+    
     h3_grid['has_pharmacy'] = 0
-    if pharmacies_data.empty:
+    
+    # ВАЛИДАЦИЯ: Унифицированная обработка пустых данных
+    if pharmacies_data is None or pharmacies_data.empty:
         return h3_grid
     
     buffer_radius = config.FEATURE_CONFIG['target_buffer_radius']

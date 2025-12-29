@@ -3,6 +3,7 @@
 Включает: подготовку данных, обучение моделей, калибровку, оценку качества.
 """
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split, cross_val_score, GroupKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -30,6 +31,56 @@ LEAKAGE_FEATURES = config.LEAKAGE_FEATURES
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+def get_model_feature_names(model):
+    """
+    Возвращает имена признаков, которые ожидает модель при predict/predict_proba.
+
+    Нужно для корректного выравнивания DataFrame колонок при инференсе,
+    особенно когда модель обёрнута в CalibratedClassifierCV / Pipeline.
+    """
+    def _extract(obj):
+        if obj is None:
+            return None
+
+        # 1) Стандартное поле sklearn (есть у многих трансформеров/пайплайнов)
+        if hasattr(obj, "feature_names_in_"):
+            try:
+                return list(obj.feature_names_in_)
+            except Exception:
+                pass
+
+        # 2) Pipeline-подобные объекты (sklearn / imblearn)
+        if hasattr(obj, "named_steps"):
+            # Иногда у самого pipeline нет feature_names_in_, но есть у шагов
+            try:
+                for step in obj.named_steps.values():
+                    names = _extract(step)
+                    if names:
+                        return names
+            except Exception:
+                pass
+
+        # 3) CalibratedClassifierCV хранит список калиброванных классификаторов
+        if hasattr(obj, "calibrated_classifiers_"):
+            try:
+                for cc in obj.calibrated_classifiers_:
+                    for attr in ("estimator", "estimator_", "base_estimator", "base_estimator_"):
+                        names = _extract(getattr(cc, attr, None))
+                        if names:
+                            return names
+            except Exception:
+                pass
+
+        # 4) Meta-estimators часто имеют estimator/base_estimator внутри
+        for attr in ("estimator", "estimator_", "base_estimator", "base_estimator_"):
+            names = _extract(getattr(obj, attr, None))
+            if names:
+                return names
+
+        return None
+
+    return _extract(model)
+
 
 def filter_leakage_features(feature_columns, exclude_leakage=True):
     """Фильтрует признаки с утечкой данных."""
@@ -48,7 +99,27 @@ def filter_leakage_features(feature_columns, exclude_leakage=True):
 
 
 def prepare_data(h3_grid, feature_columns, exclude_leakage=False):
-    """Подготовка данных для обучения: обработка пропусков и бесконечностей."""
+    """
+    Подготовка данных для обучения: обработка пропусков и бесконечностей.
+    
+    Args:
+        h3_grid: GeoDataFrame с признаками и целевой переменной
+        feature_columns: Список колонок-признаков
+        exclude_leakage: Исключить признаки с утечкой данных
+    
+    Returns:
+        tuple: (X, y) - признаки и целевая переменная
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if h3_grid is None or h3_grid.empty:
+        raise ValueError("h3_grid не может быть пустым")
+    
+    if 'has_pharmacy' not in h3_grid.columns:
+        raise ValueError("h3_grid должен содержать колонку 'has_pharmacy'")
+    
+    if not feature_columns:
+        raise ValueError("feature_columns не может быть пустым")
+    
     if exclude_leakage:
         feature_columns = filter_leakage_features(feature_columns, exclude_leakage=True)
     
@@ -66,15 +137,37 @@ def prepare_data(h3_grid, feature_columns, exclude_leakage=False):
         elif 'density' in col or 'count' in col:
             df[col] = df[col].fillna(default_count)
         else:
-            df[col] = df[col].fillna(df[col].median())
+            # ИСПРАВЛЕНО: Проверка на NaN в median() - если все значения NaN, используем 0
+            median_val = df[col].median()
+            if pd.isna(median_val):
+                # Все значения NaN - используем 0 как fallback
+                df[col] = df[col].fillna(0)
+                print(f"⚠️ Все значения в '{col}' NaN, заменены на 0")
+            else:
+                df[col] = df[col].fillna(median_val)
             
     # Обработка бесконечных значений
     for col in feature_columns:
         if col not in df.columns:
             continue
         if np.isinf(df[col]).any():
-            max_val = df[df[col] != np.inf][col].max()
-            df[col] = df[col].replace([np.inf, -np.inf], max_val)
+            # ВАЛИДАЦИЯ: Проверка наличия конечных значений
+            finite_vals = df[df[col] != np.inf][col]
+            if len(finite_vals) > 0:
+                # Есть конечные значения - используем максимум
+                max_val = finite_vals.max()
+                # Проверка на NaN (на случай если max_val тоже NaN)
+                if np.isfinite(max_val):
+                    df[col] = df[col].replace([np.inf, -np.inf], max_val)
+                else:
+                    # Все конечные значения тоже NaN - используем default
+                    replacement = default_distance if 'distance' in col else default_count
+                    df[col] = df[col].replace([np.inf, -np.inf], replacement)
+            else:
+                # Все значения inf - заменяем на default значение
+                replacement = default_distance if 'distance' in col else default_count
+                df[col] = df[col].replace([np.inf, -np.inf], replacement)
+                print(f"⚠️ Все значения в '{col}' бесконечны, заменены на {replacement}")
 
     existing_cols = [c for c in feature_columns if c in df.columns]
     X = df[existing_cols]
@@ -251,14 +344,37 @@ def expected_value_analysis(y_proba, potential_scores):
     return ev
 
 
-def train_baseline_model(X, y):
-    """Обучение baseline модели (Logistic Regression) для сравнения."""
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, 
-        test_size=config.ML_CONFIG['test_size'], 
-        random_state=config.ML_CONFIG['random_state'],
-        stratify=y
-    )
+def train_baseline_model(X_train, X_test, y_train, y_test):
+    """
+    Обучение baseline модели (Logistic Regression) для сравнения.
+    
+    ВАЖНО: Использует уже разделенные train/test данные для согласованности
+    с остальными моделями.
+    
+    Args:
+        X_train: Обучающие признаки
+        X_test: Тестовые признаки
+        y_train: Обучающая целевая переменная
+        y_test: Тестовая целевая переменная
+    
+    Returns:
+        tuple: (pipeline, metrics, X_test, y_test, y_pred, y_proba)
+    """
+    # ВАЛИДАЦИЯ входных данных
+    if X_train is None or X_train.empty:
+        raise ValueError("X_train не может быть пустым")
+    if X_test is None or X_test.empty:
+        raise ValueError("X_test не может быть пустым")
+    if len(y_train) == 0:
+        raise ValueError("y_train не может быть пустым")
+    if len(y_test) == 0:
+        raise ValueError("y_test не может быть пустым")
+    
+    # ВАЛИДАЦИЯ: Проверка наличия положительных примеров
+    if y_train.sum() == 0:
+        raise ValueError("y_train не содержит положительных примеров (все нули)")
+    if y_test.sum() == 0:
+        print("⚠️ y_test не содержит положительных примеров - метрики могут быть ненадежными")
     
     print(f"   Размер обучающей выборки: {len(y_train)} (положительных: {y_train.sum()})")
     
@@ -377,17 +493,70 @@ def objective_catboost(trial, X_train, y_train, cv_folds):
     return scores.mean()
 
 
-def train_models(X, y, h3_grid=None, use_spatial_cv=False):
+def train_models(X, y, h3_grid=None, use_spatial_cv=None, n_clusters=None):
     """
     Обучение моделей с оптимизацией гиперпараметров через Optuna.
     Включает калибровку вероятностей и расчёт бизнес-метрик.
+    
+    Args:
+        X: Признаки
+        y: Целевая переменная
+        h3_grid: GeoDataFrame с H3 ячейками (для Spatial CV)
+        use_spatial_cv: Использовать пространственную кросс-валидацию.
+                       Если None, автоматически True если h3_grid предоставлен.
+        n_clusters: Число кластеров для feature engineering. Если None, определяется автоматически.
     """
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, 
-        test_size=config.ML_CONFIG['test_size'], 
-        random_state=config.ML_CONFIG['random_state'],
-        stratify=y
-    )
+    # Автоматически включаем Spatial CV если доступны пространственные данные
+    if use_spatial_cv is None:
+        use_spatial_cv = (h3_grid is not None)
+    
+    if use_spatial_cv and h3_grid is None:
+        print("⚠️ Spatial CV запрошен, но h3_grid не предоставлен. Используется обычный train_test_split.")
+        use_spatial_cv = False
+    
+    # Используем пространственное разбиение если доступно
+    if use_spatial_cv:
+        print("\n🗺️ Использование пространственного разбиения данных (Spatial CV)...")
+        from sklearn.model_selection import GroupShuffleSplit
+        
+        # Создаем группы по пространственной близости
+        groups = get_district_groups(h3_grid)
+        
+        # Проверяем соответствие размеров
+        if len(groups) != len(X):
+            print(f"⚠️ Размер групп ({len(groups)}) не совпадает с размером X ({len(X)})")
+            print("   Используется обычный train_test_split вместо Spatial CV")
+            use_spatial_cv = False
+        else:
+            # Используем GroupShuffleSplit для пространственного разбиения
+            gss = GroupShuffleSplit(n_splits=1, test_size=config.ML_CONFIG['test_size'], 
+                                    random_state=config.ML_CONFIG['random_state'])
+            train_idx, test_idx = next(gss.split(X, y, groups))
+            
+            X_train = X.iloc[train_idx] if hasattr(X, 'iloc') else X[train_idx]
+            X_test = X.iloc[test_idx] if hasattr(X, 'iloc') else X[test_idx]
+            y_train = y.iloc[train_idx] if hasattr(y, 'iloc') else y[train_idx]
+            y_test = y.iloc[test_idx] if hasattr(y, 'iloc') else y[test_idx]
+            
+            print(f"   Пространственное разбиение: train={len(y_train)}, test={len(y_test)}")
+            print(f"   Групп: {len(np.unique(groups))}")
+        
+        # Если Spatial CV не сработал из-за несоответствия размеров, используем обычный split
+        if not use_spatial_cv:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, 
+                test_size=config.ML_CONFIG['test_size'], 
+                random_state=config.ML_CONFIG['random_state'],
+                stratify=y
+            )
+    else:
+        # Если Spatial CV не использовался, используем обычный split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, 
+            test_size=config.ML_CONFIG['test_size'], 
+            random_state=config.ML_CONFIG['random_state'],
+            stratify=y
+        )
     
     print(f"Обучение моделей. Баланс классов в обучении: {Counter(y_train)}")
     print(f"Размер тестовой выборки: {len(y_test)} (положительных: {y_test.sum()})")
@@ -396,6 +565,44 @@ def train_models(X, y, h3_grid=None, use_spatial_cv=False):
     if len(y_test) < 20 or y_test.sum() < 3:
         print("⚠️ ВНИМАНИЕ: Тестовая выборка очень маленькая. Метрики могут быть ненадежными.")
         print("   Рекомендуется использовать bootstrap CI для оценки неопределённости.")
+    
+    # Добавляем кластерные признаки ПОСЛЕ разделения на train/test
+    # Это критично для избежания переобучения
+    if h3_grid is not None:
+        # Определяем оптимальное число кластеров на train данных
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        
+        # ВАЛИДАЦИЯ: Определяем число кластеров
+        if n_clusters is None:
+            # Автоматическое определение оптимального числа кластеров
+            # Используем простую эвристику: sqrt(n_samples / 2) с ограничениями
+            n_samples = len(X_train)
+            n_clusters_for_features = max(2, min(10, int(np.sqrt(n_samples / 2))))
+            print(f"   Автоматически определено число кластеров для feature engineering: {n_clusters_for_features}")
+        else:
+            # ВАЛИДАЦИЯ: Проверка корректности переданного значения
+            if not isinstance(n_clusters, int) or n_clusters < 2:
+                print(f"⚠️ Некорректное число кластеров ({n_clusters}), используется значение по умолчанию")
+                n_clusters_for_features = 5
+            else:
+                n_clusters_for_features = min(n_clusters, 20)  # Ограничение сверху
+                print(f"   Используется заданное число кластеров для feature engineering: {n_clusters_for_features}")
+        
+        scaler_temp = StandardScaler()
+        X_train_scaled_temp = scaler_temp.fit_transform(X_train)
+        
+        kmeans_temp = KMeans(n_clusters=n_clusters_for_features, random_state=42, n_init=10)
+        kmeans_temp.fit(X_train_scaled_temp)
+        
+        # Добавляем кластерные признаки к train и test данным
+        X_train_with_clusters, X_test_with_clusters, kmeans_model, scaler_model = add_cluster_features(
+            X_train, X_test, n_clusters=n_clusters_for_features,
+            kmeans_model=kmeans_temp, scaler_model=scaler_temp
+        )
+        
+        X_train = X_train_with_clusters
+        X_test = X_test_with_clusters if X_test_with_clusters is not None else X_test
     
     results = {}
     best_model = None
@@ -407,7 +614,10 @@ def train_models(X, y, h3_grid=None, use_spatial_cv=False):
     
     # --- Baseline ---
     print("\n📊 Обучение Baseline модели (Logistic Regression)...")
-    baseline_pipeline, baseline_metrics, _, _, baseline_pred, baseline_proba = train_baseline_model(X, y)
+    # Используем те же train/test данные, что и для остальных моделей
+    baseline_pipeline, baseline_metrics, _, _, baseline_pred, baseline_proba = train_baseline_model(
+        X_train, X_test, y_train, y_test
+    )
     results['Baseline (LogReg)'] = baseline_metrics
     results['Baseline (LogReg)']['y_proba'] = baseline_proba
     results['Baseline (LogReg)']['y_pred'] = baseline_pred
@@ -605,28 +815,103 @@ def train_models(X, y, h3_grid=None, use_spatial_cv=False):
         'X_test': X_test
     }
     
+    # Сохраняем модели кластеризации для использования при предсказаниях
+    if 'kmeans_model' in locals() and 'scaler_model' in locals():
+        results['_cluster_models'] = {
+            'kmeans': kmeans_model,
+            'scaler': scaler_model,
+            'n_clusters': n_clusters_for_features if 'n_clusters_for_features' in locals() else 5
+        }
+    
     return best_model, results, X_test, y_test
 
 
-def add_cluster_features(X, n_clusters=5):
-    """Добавляет кластерные признаки к данным перед обучением модели."""
+def add_cluster_features(X_train, X_test=None, n_clusters=5, kmeans_model=None, scaler_model=None):
+    """
+    Добавляет кластерные признаки к данным перед обучением модели.
+    
+    ВАЖНО: Кластеризация выполняется ТОЛЬКО на train данных для избежания переобучения.
+    Test данные кластеризуются с использованием обученной модели кластеризации.
+    
+    Args:
+        X_train: Обучающие данные
+        X_test: Тестовые данные (опционально)
+        n_clusters: Число кластеров
+        kmeans_model: Предобученная модель KMeans (если None, обучается на X_train)
+        scaler_model: Предобученный StandardScaler (если None, обучается на X_train)
+    
+    Returns:
+        X_train_with_clusters, X_test_with_clusters (или None), kmeans_model, scaler_model
+    """
     print(f"\n📊 Предварительная кластеризация для feature engineering (k={n_clusters})...")
+    print("   ⚠️ Кластеризация выполняется ТОЛЬКО на train данных для избежания переобучения")
     
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    def _align_to_expected_columns(X, expected_cols):
+        """
+        Приводит DataFrame к нужному набору колонок (добавляет недостающие нулями,
+        удаляет лишние, сохраняет порядок). Нужен для совместимости с sklearn
+        (StandardScaler.transform проверяет feature_names).
+        """
+        if X is None:
+            return None
+        if expected_cols is None:
+            return X
+
+        X_aligned = X.copy()
+
+        # Добавляем недостающие
+        missing = [c for c in expected_cols if c not in X_aligned.columns]
+        for c in missing:
+            X_aligned[c] = 0
+
+        # Удаляем лишние и сохраняем порядок
+        X_aligned = X_aligned[[c for c in expected_cols if c in X_aligned.columns]]
+        return X_aligned
+
+    # Обучаем scaler и kmeans на train данных
+    if scaler_model is None:
+        scaler_model = StandardScaler()
+        X_train_scaled = scaler_model.fit_transform(X_train)
+    else:
+        # КРИТИЧНО: выравниваем признаки под то, на чём scaler был обучен
+        expected = list(getattr(scaler_model, "feature_names_in_", [])) or None
+        if expected is not None:
+            X_train = _align_to_expected_columns(X_train, expected)
+        X_train_scaled = scaler_model.transform(X_train)
     
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X_scaled)
+    if kmeans_model is None:
+        kmeans_model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels_train = kmeans_model.fit_predict(X_train_scaled)
+    else:
+        cluster_labels_train = kmeans_model.predict(X_train_scaled)
     
-    X_with_clusters = X.copy()
-    X_with_clusters['cluster_feature'] = cluster_labels
+    # Добавляем кластерные признаки к train данным
+    X_train_with_clusters = X_train.copy()
+    X_train_with_clusters['cluster_feature'] = cluster_labels_train
     
     for i in range(n_clusters):
-        X_with_clusters[f'cluster_{i}'] = (cluster_labels == i).astype(int)
+        X_train_with_clusters[f'cluster_{i}'] = (cluster_labels_train == i).astype(int)
+    
+    # Обрабатываем test данные если они предоставлены
+    X_test_with_clusters = None
+    if X_test is not None:
+        expected = list(getattr(scaler_model, "feature_names_in_", [])) or None
+        if expected is not None:
+            X_test = _align_to_expected_columns(X_test, expected)
+        X_test_scaled = scaler_model.transform(X_test)
+        cluster_labels_test = kmeans_model.predict(X_test_scaled)
+        
+        X_test_with_clusters = X_test.copy()
+        X_test_with_clusters['cluster_feature'] = cluster_labels_test
+        
+        for i in range(n_clusters):
+            X_test_with_clusters[f'cluster_{i}'] = (cluster_labels_test == i).astype(int)
     
     print(f"   ✓ Добавлено {n_clusters + 1} кластерных признаков")
+    if X_test is not None:
+        print("   ✓ Test данные кластеризованы с использованием обученной модели")
     
-    return X_with_clusters, cluster_labels, kmeans, scaler
+    return X_train_with_clusters, X_test_with_clusters, kmeans_model, scaler_model
 
 
 def analyze_clusters_optimal_k(X, max_k=10):
@@ -681,28 +966,36 @@ def perform_clustering(X, n_clusters):
     return clusters, kmeans, scaler
 
 
-def save_model(model, filename, feature_names=None, exclude_leakage=False):
-    """Сохранение модели с метаданными"""
+def save_model(model, filename, feature_names=None, exclude_leakage=False, results=None):
+    """Сохранение модели с метаданными и результатами обучения"""
     model_data = {
         'model': model,
         'feature_names': feature_names,
         'exclude_leakage': exclude_leakage,
+        'results': results,  # Сохраняем результаты для визуализации
     }
     joblib.dump(model_data, filename)
     print(f"💾 Модель сохранена в {filename}")
     if exclude_leakage:
         print("   (обучена без признаков с утечкой)")
+    if results:
+        print("   (с результатами обучения для визуализации)")
 
 
 def load_model(filename):
-    """Загрузка модели с метаданными"""
+    """Загрузка модели с метаданными и результатами"""
     data = joblib.load(filename)
     
     # Поддержка старого формата
     if not isinstance(data, dict) or 'model' not in data:
-        return data, None, False
+        return data, None, False, None
     
-    return data['model'], data.get('feature_names'), data.get('exclude_leakage', False)
+    return (
+        data['model'], 
+        data.get('feature_names'), 
+        data.get('exclude_leakage', False),
+        data.get('results')  # Возвращаем сохранённые результаты
+    )
 
 
 def validate_on_region(model, X_val, y_val, region_name="Валидационный регион"):
