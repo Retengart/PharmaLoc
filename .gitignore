@@ -1,0 +1,71 @@
+# Privacy-first allowlist for the public repository.
+# Everything is ignored unless it is explicitly allowed below.
+
+*
+!/.gitignore
+!/README.md
+!/app_pharmacy/
+!/app_pharmacy/**
+!/tests/
+!/tests/**
+
+# Keep the public repository focused on executable source.
+app_pharmacy/*.md
+
+# Python and runtime artifacts inside allowed directories.
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Local environments and tool state.
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+.cache/
+.pdm-python
+.pdm-build/
+.pixi/
+__pypackages__/
+
+# Generated outputs, data, models, private notes, and document artifacts.
+cache/
+data/
+catboost_info/
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.cbm
+*.geojson
+*.gpkg
+*.parquet
+*.feather
+*.csv
+*.xlsx
+*.html
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.svg
+*.pdf
+*.docx
+*.odt
+*.rtf
+*.typ
+*.bib
+*.log
